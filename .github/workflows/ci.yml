@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: crawlforge
+          POSTGRES_PASSWORD: crawlforge
+          POSTGRES_DB: crawlforge_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U crawlforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://crawlforge:crawlforge@localhost:5432/crawlforge_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.7.20"
+
+      - name: Create venv and install pinned dependencies
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python -r requirements-ci.txt
+          uv pip install --python .venv/bin/python --no-deps -e .
+
+      - name: Lint
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+
+      - name: Test
+        run: .venv/bin/pytest -q -rs

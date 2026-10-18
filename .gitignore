@@ -10,3 +10,4 @@ build/
 out*.jsonl
 out*.csv
 *.checkpoint.json
+out/
