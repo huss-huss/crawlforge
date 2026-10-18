@@ -57,4 +57,5 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "SIM", "RUF"]
-ignore = ["RUF012"]
+# ASYNC109: fetchers take an explicit timeout that is forwarded to the transport.
+ignore = ["RUF012", "ASYNC109"]
