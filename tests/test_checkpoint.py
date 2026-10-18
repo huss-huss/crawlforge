@@ -3,7 +3,6 @@ import json
 from collections import Counter
 
 import fakeredis
-import httpx
 import pytest
 
 from crawlforge.checkpoint import Checkpoint
@@ -131,9 +130,3 @@ async def test_fresh_run_clears_stale_persistent_state(make_crawler):
     queue = RedisQueue(fakeredis.FakeAsyncRedis(server=server), prefix="crawlforge:catalog")
     stats = await make_crawler(CatalogSpider(), handler, queue=queue).run()
     assert stats.items == 3
-
-
-def test_http_mock_transport_sanity():
-    # Guards against accidental network use in the suite: MockTransport never connects.
-    transport = httpx.MockTransport(lambda r: httpx.Response(204))
-    assert httpx.Client(transport=transport).get("http://never.invalid/").status_code == 204

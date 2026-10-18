@@ -61,6 +61,7 @@ class Crawler:
         clock: Clock | None = None,
         metrics: Metrics | None = None,
         retry_policy: RetryPolicy | None = None,
+        renderer: Fetcher | None = None,
     ) -> None:
         self.spider = spider
         self.settings = settings or Settings.build(spider.custom_settings)
@@ -71,6 +72,8 @@ class Crawler:
         self.fetcher: Fetcher = fetcher or HttpxFetcher(
             s.user_agent, follow_redirects=s.follow_redirects
         )
+        # Browser rendering is created lazily on the first ``render=True`` request.
+        self.renderer: Fetcher | None = renderer
         self.robots = (
             RobotsCache(self.fetcher, s.user_agent, timeout=s.timeout, clock=self.clock)
             if s.obey_robots
@@ -231,6 +234,8 @@ class Crawler:
         await self.dlq.sink.close()
         await self.rejects.sink.close()
         await self.fetcher.close()
+        if self.renderer is not None:
+            await self.renderer.close()
         await self.frontier.backend.close()
 
     # ------------------------------------------------------------------ scheduling
@@ -366,8 +371,18 @@ class Crawler:
         await self._run_callback(response)
 
     async def _fetch(self, request: Request) -> Response:
+        fetcher = self._get_renderer() if request.render else self.fetcher
         async with asyncio.timeout(self.settings.timeout):
-            return await self.fetcher.fetch(request, timeout=self.settings.timeout)
+            return await fetcher.fetch(request, timeout=self.settings.timeout)
+
+    def _get_renderer(self) -> Fetcher:
+        if self.renderer is None:
+            from crawlforge.render import PlaywrightRenderer
+
+            self.renderer = PlaywrightRenderer(
+                self.settings.user_agent, concurrency=self.settings.render_concurrency
+            )
+        return self.renderer
 
     async def _on_fetch_error(
         self, request: Request, breaker: CircuitBreaker, exc: Exception
