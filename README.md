@@ -1,5 +1,351 @@
 # CrawlForge
 
-A resilient, observable data extraction framework for async Python.
+**A resilient, observable data extraction framework for async Python.**
 
-Work in progress.
+CrawlForge is a small crawling framework built on `asyncio` + `httpx`. You write a spider; the
+framework takes care of scheduling, de-duplication, politeness, retries, circuit breaking,
+validation, output, metrics and resumable state.
+
+```python
+from pydantic import BaseModel
+from crawlforge import Spider
+
+class Quote(BaseModel):
+    text: str
+    author: str
+    tags: list[str]
+
+class QuotesSpider(Spider):
+    name = "quotes"
+    start_urls = ["https://quotes.toscrape.com/"]
+    item_model = Quote
+
+    def parse(self, response):
+        for q in response.css("div.quote"):
+            yield {
+                "text": q.css("span.text::text").get(),
+                "author": q.css("small.author::text").get(),
+                "tags": q.css("a.tag::text").getall(),
+            }
+        if next_page := response.css("li.next a::attr(href)").get():
+            yield response.follow(next_page)
+```
+
+```bash
+crawlforge run quotes.py --sink jsonl:out/quotes.jsonl --concurrency 8
+```
+
+## Why it exists
+
+Writing the code that pulls data out of one page is the easy part. Production crawls usually fail
+somewhere else:
+
+- a site starts returning 503s or 429s and the crawler either hammers it or gives up;
+- a selector silently breaks and garbage flows into the database;
+- the process dies at 80% and starts over from zero;
+- nobody can tell whether the crawl is healthy until it's over.
+
+CrawlForge handles each of these explicitly: retries with backoff that honor `Retry-After`, a
+circuit breaker per domain, a dead-letter queue, schema validation with a rejects sink,
+checkpoints, and Prometheus metrics. It's small enough to read in an afternoon (about 2.5k
+lines of library code).
+
+## Architecture
+
+```
+                 +----------------------------------------------------------------+
+  Spider         |                         Crawler (engine)                       |
+  start_requests +--> Frontier ------------------------------------------+        |
+  parse()  <-----+    | dedupe (normalized URL fingerprint), max depth   |        |
+    |            |    | QueueBackend: MemoryQueue | RedisQueue (zset+set)|        |
+    |            |    +------------------------+-------------------------+        |
+    |            |                             | pop (N workers)                  |
+    |            |                             v                                  |
+    |            |   robots.txt cache --> circuit breaker --> per-domain slot     |
+    |            |   (RFC 9309, per          (per domain:     (semaphore +        |
+    |            |    origin, crawl-delay)    closed/open/     token bucket)      |
+    |            |                            half-open)            |             |
+    |            |                                                  v             |
+    |            |                          Fetcher: httpx  |  PlaywrightRenderer |
+    |            |                                    (render=True, lazy import)  |
+    |            |                                                  |             |
+    |            |          +---------------------------------------+             |
+    |            |          v                                                     |
+    |            |   classify: 2xx/3xx -> callback                                |
+    |            |             408/425/429/5xx, timeouts, conn errors -> retry    |
+    |            |               (full-jitter backoff or Retry-After, deferred    |
+    |            |                on a timer, never blocking a worker)            |
+    |            |             retries exhausted / 4xx / callback error -> DLQ    |
+    |            |                                                                |
+    +-- yields --+--> Request ---------------------------------------> Frontier   |
+                 |    dict / BaseModel --> pydantic validate --+--> Sinks         |
+                 |                                             |    (JSONL, CSV,  |
+                 |                                             |     Postgres     |
+                 |                                             |     upsert)      |
+                 |                                             +--> rejects.jsonl |
+                 |                                                                |
+                 |  Checkpoint (queue + in-flight + deferred + seen) <- periodic, |
+                 |  on stop, on cancel.   Metrics -> /metrics (Prometheus)       |
+                 |  JSON logs -> stderr.  stats.json at the end of every run.     |
+                 +----------------------------------------------------------------+
+```
+
+Source layout (`src/crawlforge/`):
+
+| Module | Responsibility |
+| --- | --- |
+| `engine.py` | Worker loop, request pipeline, deferral, shutdown, checkpoint capture |
+| `spider.py`, `http.py` | Public API: `Spider`, `Request`, `Response` (parsel selectors) |
+| `frontier.py`, `queues/` | Dedupe + depth limits; memory and Redis priority queues |
+| `url.py` | URL normalization and request fingerprints |
+| `ratelimit.py` | Token bucket, per-domain throttle, robots crawl-delay |
+| `retry.py`, `breaker.py` | Retry classification/backoff, circuit breaker state machine |
+| `robots.py` | robots.txt cache with RFC 9309 failure semantics |
+| `fetch.py`, `render.py` | httpx fetcher, optional Playwright renderer |
+| `sinks/`, `deadletter.py` | JSONL / CSV / Postgres sinks, DLQ and rejects writers |
+| `checkpoint.py`, `stats.py` | Atomic checkpoint files, run statistics |
+| `metrics.py`, `logs.py` | Prometheus registry, JSON log formatter |
+| `cli.py` | `crawlforge run`, `crawlforge stats` |
+
+## Design decisions and trade-offs
+
+- **Retries are deferred, not slept.** A request that needs to back off (or that hits an open
+  breaker) is handed to a timer task that re-queues it later. Workers never sit idle inside a
+  `sleep`, so one slow domain can't use up the worker pool with backoff waits.
+- **Full-jitter exponential backoff** (`uniform(0, min(cap, base * 2^n))`) spreads retries out
+  so they don't arrive at the server in synchronized bursts. When the server sends
+  `Retry-After` (seconds or HTTP-date), that value wins, capped at `max_retry_after`.
+- **Circuit breaker per domain**, counting *consecutive* failures (retryable statuses and
+  transport errors). When it's open, nothing is sent to that domain. After
+  `breaker_recovery` seconds, one half-open probe decides whether the breaker closes again.
+  4xx responses count as a success for the breaker, since the server is up and answering.
+  Errors that aren't the server's fault (bad URL, missing renderer) release the probe slot
+  without judging the domain.
+- **Callbacks are stored by name** (`Request.callback == "parse_book"`). That keeps requests
+  JSON-serializable, so they can go into Redis and into checkpoints.
+- **Dedupe at enqueue time** on a SHA-1 of method + normalized URL + body. Normalization
+  lower-cases the scheme and host, drops default ports and fragments, sorts query params and
+  resolves dot segments. Retries bypass dedupe by design. `dont_filter=True` opts out.
+- **Checkpoint consistency.** Frontier mutations (pop+register, push) and checkpoint capture
+  share one lock. Without it, a snapshot could miss a request that is moving between the
+  queue, a worker and a timer. In-flight requests are included in checkpoints. A graceful stop
+  drains them first (each completed page is processed once). A hard kill or cancel re-fetches
+  them on resume (at-least-once for those pages). The Postgres upsert sink makes that
+  idempotent.
+- **One registry per crawler** for Prometheus metrics: no global state, and tests stay
+  isolated.
+- **Robots.txt follows RFC 9309:** 4xx means "no rules", 5xx or a network error means
+  "disallow everything". Error results are re-checked after `error_ttl` instead of being
+  cached for an hour. `Crawl-delay` can only slow a domain down, never speed it up.
+- **File sinks use plain buffered writes** from the event loop. That's simple and fast enough
+  for JSONL/CSV volumes. A crawl producing very large items at very high rates would want a
+  writer thread.
+- **Head-of-line blocking is accepted.** A worker pops a request and then waits for that
+  domain's slot. With a single domain this costs nothing. With many domains and a tiny global
+  concurrency, one throttled domain can hold workers. Per-domain queues are on the roadmap.
+
+## Quick start
+
+```bash
+git clone <this repo> crawlforge && cd crawlforge
+uv venv .venv --python 3.12
+uv pip install --python .venv/bin/python -e ".[dev]"          # core + test tooling
+uv pip install --python .venv/bin/python -e ".[browser]"      # optional: Playwright
+.venv/bin/playwright install chromium                          # optional: browser binary
+
+.venv/bin/crawlforge run examples/books.py --sink jsonl:out/books.jsonl --concurrency 8
+.venv/bin/crawlforge stats --file .crawlforge/stats.json
+```
+
+With the full local stack (Redis frontier, Postgres sink, Prometheus):
+
+```bash
+docker compose up -d
+crawlforge run examples/books.py \
+  --queue redis://localhost:6379/0 \
+  --sink "postgresql://crawlforge:crawlforge@localhost:5432/crawlforge?table=books&key=upc" \
+  --metrics-port 9410
+# http://localhost:9090  ->  rate(crawlforge_requests_total[1m])
+crawlforge stats --metrics-url http://localhost:9410/metrics      # live view from the CLI
+```
+
+Stop with Ctrl-C and resume later:
+
+```bash
+crawlforge run examples/books.py --sink jsonl:out/books.jsonl --checkpoint .crawlforge/books.ckpt.json
+^C   # graceful: in-flight pages finish, the rest is checkpointed
+crawlforge run examples/books.py --sink jsonl:out/books.jsonl --checkpoint .crawlforge/books.ckpt.json --resume
+```
+
+On resume, sinks open in append mode and the stats total both runs. The checkpoint is deleted
+once the crawl finishes. Redis-backed crawls can also resume straight from Redis
+(`--queue redis://... --resume`) without a checkpoint file.
+
+### Real run (books.toscrape.com)
+
+Measured on the development machine on 2026-10-18 with the command above (`--concurrency 8`,
+the spider's defaults of 5 req/s and 4 concurrent requests per domain, about 1.1 s
+round-trip to the site from where it ran):
+
+| requests | items | rejects | retries | dead letters | wall time |
+| --- | --- | --- | --- | --- | --- |
+| 1050 | 1000 | 0 | 0 | 0 | 275 s |
+
+All 1000 books came out with unique UPCs across 50 categories. That throughput (~3.8 req/s)
+is limited by per-domain concurrency × latency, not by the rate limit. It's a deliberate,
+polite default.
+
+`examples/quotes.py`: 10 requests, 100 quotes, about 5 s. `examples/quotes_js.py` through
+headless Chromium: 10 rendered pages, 100 quotes, about 37 s at 1 req/s. A SIGINT followed by
+`--resume` on the quotes spider ended with exactly 100 unique quotes across the two runs.
+
+## Writing a spider
+
+```python
+from crawlforge import Request, Response, Spider
+
+class MySpider(Spider):
+    name = "my_spider"                     # also the Redis key namespace
+    start_urls = ["https://example.org/"]  # or override start_requests()
+    item_model = MyPydanticModel           # optional; dict items are validated against it
+    custom_settings = {"rate_per_domain": 1.0, "max_depth": 3}
+
+    def start_requests(self):              # may be a sync or async generator
+        yield Request("https://example.org/", callback=self.parse, priority=5)
+
+    def parse(self, response: Response):   # sync/async function or (async) generator
+        yield {"title": response.css("title::text").get()}            # item (dict)
+        yield MyPydanticModel(...)                                      # item (already valid)
+        yield response.follow("/next", callback=self.parse_detail)     # follow-up request
+        yield Request(url, render=True, meta={"wait_for": ".loaded"})  # Playwright page
+```
+
+- `Response` has `.css()`, `.xpath()` (parsel), `.text`, `.json()`, `.urljoin()`, `.follow()`,
+  `.status`, `.headers`, `.rendered` and `.request` (with `.depth` and `.meta`).
+- Higher `priority` is fetched first. Depth is set by the engine (parent + 1).
+- Items that fail validation go to `rejects.jsonl` with the pydantic error list. A callback
+  that raises sends its request to the DLQ with `callback_error:<Type>`, and items it yielded
+  before the error are kept.
+- Non-2xx/3xx responses go to the DLQ (`http_404`, ...) unless they're listed in
+  `handle_statuses`.
+
+## Configuration
+
+Precedence: defaults < `Spider.custom_settings` < CLI flags / `--set key=value`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `user_agent` | `CrawlForge/0.1.0 (+https://github.com/huss-huss/crawlforge)` | Sent on every request and used for robots matching. Put your own contact URL here. |
+| `obey_robots` | `true` | Fetch and obey robots.txt (`--ignore-robots` only for sites you own) |
+| `concurrency` | `8` | Global workers |
+| `per_domain_concurrency` | `2` | Simultaneous requests per domain |
+| `rate_per_domain` / `burst` | `2.0` / `2.0` | Token bucket per domain (req/s, bucket size) |
+| `timeout` | `30` | Total seconds per attempt |
+| `max_retries` | `3` | Retries after the first attempt |
+| `backoff_base` / `backoff_cap` | `0.5` / `30` | Full-jitter exponential backoff window |
+| `max_retry_after` | `300` | Upper bound for honoring `Retry-After` |
+| `breaker_threshold` / `breaker_recovery` | `5` / `30` | Consecutive failures to open; seconds until the probe |
+| `max_depth` / `max_requests` | unset | Scope limits (`max_requests` stops gracefully and checkpoints) |
+| `handle_statuses` | `[]` | Error statuses passed to callbacks instead of the DLQ |
+| `render_concurrency` | `2` | Concurrent browser pages |
+| `output_dir` | `.crawlforge` | Default location of `dlq.jsonl`, `rejects.jsonl`, `stats.json` |
+| `checkpoint_path` / `checkpoint_interval` | unset / `30` | Checkpoint file and periodic save interval |
+| `metrics_port` / `metrics_addr` | unset / `0.0.0.0` | Prometheus endpoint |
+
+Sinks: `--sink jsonl:PATH`, `--sink csv:PATH`,
+`--sink "postgresql://user:pass@host/db?table=T&key=FIELD"` (repeatable). The Postgres sink
+creates `T(key TEXT PRIMARY KEY, data JSONB, scraped_at TIMESTAMPTZ)` and upserts in batches,
+so a re-crawl updates rows instead of duplicating them.
+
+Queues: `--queue memory` (default) or `--queue redis://host:6379/0`. Keys are namespaced
+`crawlforge:<spider>:{queue,seen,seq}`. A fresh (non-`--resume`) run clears its own namespace.
+
+## Metrics
+
+Exposed at `http://<host>:<metrics_port>/metrics`:
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `crawlforge_requests_total` | counter | `domain` (each attempt) |
+| `crawlforge_responses_total` | counter | `domain`, `status` |
+| `crawlforge_fetch_errors_total` | counter | `domain`, `error` |
+| `crawlforge_retries_total` | counter | `domain`, `reason` |
+| `crawlforge_items_total` | counter | `spider` |
+| `crawlforge_item_rejects_total` | counter | `spider` |
+| `crawlforge_dead_letters_total` | counter | `domain`, `reason` |
+| `crawlforge_requests_dropped_total` | counter | `reason` (`duplicate`, `too_deep`, `robots`) |
+| `crawlforge_request_latency_seconds` | histogram | `domain` |
+| `crawlforge_circuit_breaker_state` | gauge | `domain` (0 closed, 1 half-open, 2 open) |
+| `crawlforge_circuit_breaker_trips_total` | counter | `domain` |
+| `crawlforge_frontier_size` | gauge | |
+| `crawlforge_in_flight` | gauge | |
+| `crawlforge_deferred` | gauge | requests waiting on backoff or an open breaker |
+
+Logs are JSON lines on stderr (`--plain-logs` for human-readable output), with structured
+fields such as `url`, `status`, `reason`, `attempt` and `delay`. A `progress` line is logged
+every 10 s.
+
+## Responsible scraping
+
+CrawlForge's defaults are meant to be polite: robots.txt is obeyed (including `Crawl-delay`),
+each domain gets at most 2 concurrent requests at 2 req/s, failing servers are backed off from
+rather than retried harder, and the user agent identifies the tool. Before you crawl anything:
+
+- read the site's terms of service, and don't collect personal data you have no lawful basis
+  to process;
+- set `user_agent` to something that identifies you and gives a way to reach you;
+- prefer official APIs or data dumps when they exist;
+- keep rates low, crawl off-peak, and cache instead of re-fetching;
+- use `--ignore-robots` only on sites you own or have permission to crawl.
+
+The bundled examples only target [books.toscrape.com](https://books.toscrape.com) and
+[quotes.toscrape.com](https://quotes.toscrape.com), sandboxes published specifically for
+scraping practice.
+
+## Testing
+
+```bash
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+.venv/bin/pytest -q
+TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/db .venv/bin/pytest -q   # + Postgres sink
+```
+
+The suite never touches the internet. Engine tests use `httpx.MockTransport` and a
+`FakeClock` whose `sleep` advances virtual time, so backoff, `Retry-After`, breaker recovery
+windows and rate-limiter timing are asserted exactly and run in milliseconds. CLI tests use a
+throwaway HTTP server on `127.0.0.1`. Redis behavior is tested with `fakeredis`. The real
+browser test runs only where Playwright and Chromium are installed. CI (GitHub Actions) runs
+ruff and pytest on Python 3.12 with the pinned `requirements-ci.txt` and a Postgres service,
+so the Postgres sink test runs there too.
+
+## Limitations (v0.1)
+
+- Single process. The Redis backend makes the frontier persistent and shareable, but there's
+  no coordination for running several crawler processes against it at once (no lease or
+  visibility timeout for popped requests).
+- Requests that are in flight when the process is killed hard are re-fetched on resume
+  (at-least-once for those pages). File sinks may then contain duplicates for those pages; the
+  Postgres sink deduplicates by key.
+- No HTTP cache, cookie/session management helpers, proxy rotation, or sitemap support.
+- `item_model` is one schema per spider. Yield pydantic instances directly if you need several.
+- Checkpoint files hold the whole frontier and seen set in JSON. That's fine for hundreds of
+  thousands of URLs, not for hundreds of millions (use Redis plus a Bloom filter there).
+- The Playwright renderer uses a fresh browser context per page (isolated but slower). Its
+  timeouts are mapped to retryable errors, but it has no request interception or resource
+  blocking yet.
+- `docker-compose.yml` is checked with `docker compose config`, but the stack wasn't brought up
+  during development (no Docker daemon was available). The Redis queue is tested only against
+  fakeredis, and the Postgres sink against a real local PostgreSQL 17.
+
+## Roadmap
+
+- Per-domain queues to remove head-of-line blocking; adaptive (AutoThrottle-style) rate control
+- `crawlforge replay-dlq` to re-queue dead letters after a fix
+- Lease-based Redis pops for multi-process crawls; Bloom-filter seen set
+- Sitemap and RSS discovery, HTTP caching (ETag/Last-Modified), proxy pools
+- Grafana dashboard JSON next to the Prometheus config
+- Parquet and S3 sinks; item pipelines (transform/enrich) before sinks
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Hussen Mohammed.
