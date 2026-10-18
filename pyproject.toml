@@ -55,6 +55,10 @@ line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
 
+[tool.ruff.format]
+# README snippets are aligned for reading; ruff 0.17 would otherwise format Markdown code.
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "SIM", "RUF"]
 # ASYNC109: fetchers take an explicit timeout that is forwarded to the transport.
