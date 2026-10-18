@@ -72,6 +72,14 @@ class CircuitBreaker:
             return min(1.0, self.recovery_timeout)
         return 0.0
 
+    def release_probe(self) -> None:
+        """Give back a half-open probe slot without judging the domain.
+
+        Used when a request fails for reasons unrelated to the server (bad URL,
+        robots, a bug in a callback) so the breaker does not stay stuck.
+        """
+        self._probe_in_flight = False
+
     def record_success(self) -> None:
         self._state = BreakerState.CLOSED
         self._failures = 0
