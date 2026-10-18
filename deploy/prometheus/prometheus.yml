@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: crawlforge
+    static_configs:
+      # The crawler runs on the host: `crawlforge run ... --metrics-port 9410`
+      - targets: ["host.docker.internal:9410"]

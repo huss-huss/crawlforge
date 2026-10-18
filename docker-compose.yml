@@ -1,0 +1,50 @@
+# Local infrastructure for CrawlForge: Redis (frontier), Postgres (sink) and
+# Prometheus scraping the crawler's metrics endpoint on the host.
+#
+#   docker compose up -d
+#   crawlforge run examples/books.py \
+#       --queue redis://localhost:6379/0 \
+#       --sink "postgresql://crawlforge:crawlforge@localhost:5432/crawlforge?table=books&key=upc" \
+#       --metrics-port 9410
+#
+# Prometheus UI: http://localhost:9090  (try: rate(crawlforge_requests_total[1m]))
+# Credentials below are for local development only.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: crawlforge
+      POSTGRES_PASSWORD: crawlforge
+      POSTGRES_DB: crawlforge
+    ports: ["5432:5432"]
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawlforge"]
+      interval: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis-data:
+  pg-data:
