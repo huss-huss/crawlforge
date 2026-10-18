@@ -23,6 +23,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from crawlforge.breaker import BreakerRegistry, BreakerState, CircuitBreaker
+from crawlforge.checkpoint import Checkpoint
 from crawlforge.clock import Clock, SystemClock
 from crawlforge.deadletter import DeadLetterQueue, RejectsSink
 from crawlforge.fetch import Fetcher, HttpxFetcher
@@ -103,6 +104,10 @@ class Crawler:
         self._stop_reason: str | None = None
         self._done = asyncio.Event()
         self._wakeup = asyncio.Event()
+        # Serializes frontier mutations (pop+register, push) against checkpoint capture so a
+        # snapshot never misses a request that is moving between queue, workers and timers.
+        self._lock = asyncio.Lock()
+        self.checkpoint = Checkpoint(s.checkpoint_path) if s.checkpoint_path else None
 
     # ------------------------------------------------------------------ control
 
@@ -154,6 +159,30 @@ class Crawler:
     # ------------------------------------------------------------------ setup / teardown
 
     async def _seed(self) -> None:
+        s = self.settings
+        backend = self.frontier.backend
+        if s.resume and self.checkpoint is not None and self.checkpoint.exists():
+            data = self.checkpoint.load(spider=self.spider.name)
+            async with self._lock:
+                await backend.restore(data["frontier"])
+            self.stats.absorb(data.get("stats", {}))
+            self.stats.resumed = True
+            log.info(
+                "resumed from checkpoint",
+                extra={
+                    "path": str(self.checkpoint.path),
+                    "pending": len(data["frontier"]["pending"]),
+                    "seen": len(data["frontier"]["seen"]),
+                },
+            )
+            return
+        if s.resume and backend.persistent and await backend.size() > 0:
+            self.stats.resumed = True
+            log.info("resumed from persistent queue", extra={"pending": await backend.size()})
+            return
+        if s.resume:
+            log.info("nothing to resume; starting fresh")
+        await backend.clear()
         start = self.spider.start_requests()
         if hasattr(start, "__aiter__"):
             async for request in start:
@@ -169,10 +198,11 @@ class Crawler:
         for task, _ in leftovers:
             task.cancel()
         await asyncio.gather(*(t for t, _ in leftovers), return_exceptions=True)
-        for request in [*self._active.values(), *(r for _, r in leftovers)]:
-            await self.frontier.push(request, force=True)
-        self._active.clear()
-        self._deferred.clear()
+        async with self._lock:
+            for request in [*self._active.values(), *(r for _, r in leftovers)]:
+                await self.frontier.push(request, force=True)
+            self._active.clear()
+            self._deferred.clear()
 
         remaining = await self.frontier.size()
         if error is not None:
@@ -181,6 +211,16 @@ class Crawler:
             self.stats.finish_reason = self._stop_reason
         else:
             self.stats.finish_reason = "finished" if remaining == 0 else "stopped"
+
+        if self.checkpoint is not None:
+            if remaining == 0 and error is None:
+                self.checkpoint.remove()
+            else:
+                await self.save_checkpoint()
+                log.info(
+                    "checkpoint saved",
+                    extra={"path": str(self.checkpoint.path), "pending": remaining},
+                )
 
         for sink in self.sinks:
             try:
@@ -191,11 +231,13 @@ class Crawler:
         await self.dlq.sink.close()
         await self.rejects.sink.close()
         await self.fetcher.close()
+        await self.frontier.backend.close()
 
     # ------------------------------------------------------------------ scheduling
 
     async def _schedule(self, request: Request, *, force: bool = False) -> PushResult:
-        result = await self.frontier.push(request, force=force)
+        async with self._lock:
+            result = await self.frontier.push(request, force=force)
         if result is PushResult.DUPLICATE:
             self.stats.duplicates += 1
             self.metrics.dropped.labels("duplicate").inc()
@@ -209,7 +251,9 @@ class Crawler:
     def _defer(self, request: Request, delay: float) -> None:
         async def requeue() -> None:
             await self.clock.sleep(delay)
-            await self.frontier.push(request, force=True)
+            async with self._lock:
+                self._deferred.pop(task, None)
+                await self.frontier.push(request, force=True)
             self._wakeup.set()
 
         task = asyncio.create_task(requeue())
@@ -222,15 +266,16 @@ class Crawler:
             if s.max_requests is not None and self._dispatched >= s.max_requests:
                 self.stop("max_requests")
                 return
-            request = await self.frontier.pop()
+            async with self._lock:
+                request = await self.frontier.pop()
+                if request is not None:
+                    self._dispatched += 1
+                    key = id(request)
+                    self._active[key] = request
             if request is None:
                 if await self._wait_for_work():
                     return
                 continue
-            # No await between pop and registration: the request is never invisible.
-            self._dispatched += 1
-            key = id(request)
-            self._active[key] = request
             try:
                 await self._process(request)
             except asyncio.CancelledError:
@@ -473,18 +518,40 @@ class Crawler:
                 self.stats.sink_errors += 1
                 log.exception("sink write failed", extra={"sink": sink.name})
 
+    # ------------------------------------------------------------------ checkpoints
+
+    async def save_checkpoint(self) -> None:
+        """Persist queue + in-flight + deferred requests and the seen set.
+
+        In-flight requests are included so a crash re-fetches them (at-least-once).
+        """
+        if self.checkpoint is None:
+            return
+        async with self._lock:
+            extra = [r.to_dict() for r in (*self._active.values(), *self._deferred.values())]
+            snapshot = await self.frontier.backend.snapshot()
+        snapshot["pending"] = snapshot["pending"] + extra
+        stats = self.stats.to_dict()
+        self.checkpoint.save(spider=self.spider.name, frontier=snapshot, stats=stats)
+
     # ------------------------------------------------------------------ monitoring
 
     async def _monitor(self) -> None:
-        last_progress = self.clock.monotonic()
+        last_progress = last_checkpoint = self.clock.monotonic()
         while True:
             await asyncio.sleep(1.0)
+            now = self.clock.monotonic()
+            if (
+                self.checkpoint is not None
+                and now - last_checkpoint >= self.settings.checkpoint_interval
+            ):
+                last_checkpoint = now
+                await self.save_checkpoint()
             self.metrics.frontier_size.set(await self.frontier.size())
             self.metrics.in_flight.set(len(self._active))
             self.metrics.deferred.set(len(self._deferred))
             for domain, state in self.breakers.states().items():
                 self.metrics.breaker_state.labels(domain).set(int(state))
-            now = self.clock.monotonic()
             if now - last_progress >= self.settings.progress_interval:
                 last_progress = now
                 log.info(

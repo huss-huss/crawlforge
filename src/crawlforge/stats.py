@@ -38,6 +38,16 @@ class CrawlStats:
         data["status_counts"] = dict(sorted(self.status_counts.items()))
         return data
 
+    def absorb(self, previous: dict[str, Any]) -> None:
+        """Add counters from an earlier (checkpointed) run so totals span a resume."""
+        for name, value in previous.items():
+            if name == "status_counts":
+                self.status_counts.update(value)
+            elif isinstance(value, int) and not isinstance(value, bool):
+                current = getattr(self, name, None)
+                if isinstance(current, int) and not isinstance(current, bool):
+                    setattr(self, name, current + value)
+
     def write(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
