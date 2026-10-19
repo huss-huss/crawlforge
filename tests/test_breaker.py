@@ -1,3 +1,5 @@
+import math
+
 from crawlforge.breaker import BreakerRegistry, BreakerState, CircuitBreaker
 from crawlforge.clock import FakeClock
 
@@ -62,3 +64,21 @@ def test_registry_is_per_domain():
     assert registry.get("a.test").state is BreakerState.OPEN
     assert registry.get("b.test").state is BreakerState.CLOSED
     assert registry.states() == {"a.test": BreakerState.OPEN, "b.test": BreakerState.CLOSED}
+
+
+def test_registry_reports_blocked_domains():
+    clock = FakeClock()
+    registry = BreakerRegistry(failure_threshold=1, recovery_timeout=10, clock=clock)
+    registry.get("ok.test")
+    registry.get("down.test").record_failure()
+    assert registry.blocked() == {"down.test": 10}
+    clock.advance(4)
+    assert registry.blocked() == {"down.test": 6}
+    clock.advance(6)
+    # Half-open: free for its probe, unless a request of the domain is already in flight.
+    assert registry.blocked() == {}
+    assert registry.blocked(busy={"down.test"}) == {"down.test": math.inf}
+    # A probe claimed with nothing in flight was orphaned; it is released.
+    assert registry.get("down.test").allow()
+    assert registry.blocked() == {}
+    assert registry.get("down.test").allow()

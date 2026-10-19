@@ -2,12 +2,20 @@
 
 Request lifecycle::
 
-    frontier.pop -> robots check -> circuit breaker -> per-domain slot (semaphore + token
-    bucket) -> fetch (HTTP or browser) -> classify -> retry / dead-letter / callback ->
-    items (validate -> sinks | rejects) and follow-up requests (-> frontier)
+    frontier.receive (next request of a ready domain) -> robots check -> circuit breaker ->
+    per-domain slot (semaphore + token bucket) -> fetch (HTTP or browser) -> classify ->
+    retry / dead-letter / callback -> items (validate -> sinks | rejects) and follow-up
+    requests (-> frontier)
 
-Retries and requests refused by an open breaker are *deferred*: a timer task re-queues
-them later, so a worker is never parked on a backoff sleep.
+Scheduling is per domain: a worker asks the frontier for the next request of a domain it can
+send to right now, skipping domains that are out of rate tokens, at their concurrency cap or
+behind an open circuit breaker. Their requests wait in the queue instead of holding a
+worker, so one slow domain can't stall the others (no head-of-line blocking). When every
+domain with queued work is blocked, one timer wakes the workers when the first of them
+becomes ready.
+
+Retries are *deferred*: a timer task re-queues them later, so a worker is never parked on a
+backoff sleep.
 
 With a leasing backend (Redis) every popped request is leased: the lease is extended while
 the request is processed or deferred, acked once it is done (callback run, or dead-lettered),
@@ -22,6 +30,8 @@ import asyncio
 import inspect
 import json
 import logging
+import math
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -105,6 +115,8 @@ class Crawler:
         self.rejects = RejectsSink(JsonlSink(s.resolved("rejects"), append=append))
 
         self._active: dict[int, Request] = {}
+        # Domains of active requests that haven't taken their rate token yet, by id(request).
+        self._unpaid: dict[int, str] = {}
         # Lease ids of requests this process holds (active or deferred), by id(request).
         self._leases: dict[int, str] = {}
         # Held leases another process reclaimed; kept so a late ack/requeue is a no-op.
@@ -117,6 +129,11 @@ class Crawler:
         self._stop_reason: str | None = None
         self._done = asyncio.Event()
         self._wakeup = asyncio.Event()
+        # Bumped by every wakeup, so a worker that missed the event still notices it.
+        self._signals = 0
+        # Wakes the workers when the first blocked domain with queued work becomes ready.
+        self._timer: asyncio.Task[None] | None = None
+        self._timer_due = 0.0
         # Serializes frontier mutations (pop+register, push) against checkpoint capture so a
         # snapshot never misses a request that is moving between queue, workers and timers.
         self._lock = asyncio.Lock()
@@ -130,7 +147,11 @@ class Crawler:
             log.info("stopping crawl", extra={"reason": reason})
             self._stopping = True
             self._stop_reason = reason
-            self._wakeup.set()
+            self._wake()
+
+    def _wake(self) -> None:
+        self._signals += 1
+        self._wakeup.set()
 
     async def run(self) -> CrawlStats:
         s = self.settings
@@ -215,6 +236,8 @@ class Crawler:
 
     async def _shutdown(self, error: BaseException | None) -> None:
         self._stopping = True
+        if self._timer is not None:
+            self._timer.cancel()
         # Anything not finished goes back to the frontier so a checkpoint keeps it.
         leftovers = list(self._deferred.items())
         for task, _ in leftovers:
@@ -236,6 +259,7 @@ class Crawler:
                 for _, request in active:
                     await self.frontier.push(request, force=True)
             self._active.clear()
+            self._unpaid.clear()
             self._deferred.clear()
             self._leases.clear()
             self._lost.clear()
@@ -283,7 +307,7 @@ class Crawler:
             self.stats.too_deep += 1
             self.metrics.dropped.labels("too_deep").inc()
         else:
-            self._wakeup.set()
+            self._wake()
         return result
 
     def _defer(self, request: Request, delay: float) -> None:
@@ -297,7 +321,7 @@ class Crawler:
                 if not await self.frontier.backend.requeue(lease, request):
                     self._lease_lost(request, lease)
                 self._lost.discard(lease or "")
-            self._wakeup.set()
+            self._wake()
 
         task = asyncio.create_task(requeue())
         self._deferred[task] = request
@@ -309,17 +333,23 @@ class Crawler:
             if s.max_requests is not None and self._dispatched >= s.max_requests:
                 self.stop("max_requests")
                 return
+            signals = self._signals
             async with self._lock:
-                delivery = await self.frontier.receive(s.lease_ttl)
+                checked = self.clock.monotonic()
+                blocked = self._blocked()
+                delivery = await self.frontier.receive(s.lease_ttl, skip=blocked)
                 if delivery is not None:
                     self._dispatched += 1
                     request = delivery.request
                     key = id(request)
                     self._active[key] = request
+                    self._unpaid[key] = request.domain
                     if delivery.lease is not None:
                         self._leases[key] = delivery.lease
             if delivery is None:
-                if await self._wait_for_work():
+                if blocked:
+                    await self._wake_when_ready(blocked, checked)
+                if await self._wait_for_work(signals):
                     return
                 continue
             try:
@@ -340,6 +370,9 @@ class Crawler:
         """Done with a popped request: ack its lease unless a timer now owns it (deferred)."""
         async with self._lock:
             self._active.pop(key, None)
+            self._unpaid.pop(key, None)
+            # Its domain may be under its concurrency cap (or past its probe) again.
+            self._wake()
             if any(r is request for r in self._deferred.values()):
                 return
             lease = self._leases.pop(key, None)
@@ -357,8 +390,56 @@ class Crawler:
         self.stats.leases_lost += 1
         log.warning("lease lost", extra={"url": request.url, "lease_ttl": self.settings.lease_ttl})
 
-    async def _wait_for_work(self) -> bool:
-        """Idle until new work may exist. Returns True when the crawl is complete."""
+    def _blocked(self) -> dict[str, float]:
+        """Domains this process can't send to now -> seconds until they may be ready.
+
+        ``inf`` means "until one of the domain's active requests finishes": settling wakes
+        the workers, no timer is needed.
+        """
+        active = Counter(r.domain for r in self._active.values())
+        blocked = self.throttle.throttled(Counter(self._unpaid.values()))
+        for domain, n in active.items():
+            if n >= self.throttle.concurrency:
+                blocked[domain] = math.inf
+        for domain, wait in self.breakers.blocked(active).items():
+            blocked[domain] = max(blocked.get(domain, 0.0), wait)
+        return blocked
+
+    async def _wake_when_ready(self, blocked: dict[str, float], checked: float) -> None:
+        """Nothing was ready: arm the timer for the first blocked domain that has work.
+
+        ``blocked`` holds waits measured at ``checked``; the queue lookup may take a while
+        (Redis), so the timer is set for that absolute time, not for the wait.
+        """
+        timed = [domain for domain, wait in blocked.items() if wait != math.inf]
+        if not timed:
+            return
+        waiting = await self.frontier.backend.queued_domains(timed)
+        if not waiting:
+            return
+        due = checked + min(blocked[domain] for domain in waiting)
+        delay = due - self.clock.monotonic()
+        if delay <= 0:
+            self._wake()  # ready already (another timer got there first)
+            return
+        if self._timer is not None and not self._timer.done():
+            if self._timer_due <= due:
+                return
+            self._timer.cancel()
+
+        async def ring() -> None:
+            await self.clock.sleep(delay)
+            self._wake()
+
+        self._timer_due = due
+        self._timer = asyncio.create_task(ring())
+
+    async def _wait_for_work(self, signals: int) -> bool:
+        """Idle until new work may exist. Returns True when the crawl is complete.
+
+        ``signals`` is the wakeup count seen before the frontier was found empty (or
+        blocked); a wakeup since then means there may be work again, so don't wait.
+        """
         self._idle += 1
         try:
             if (
@@ -368,8 +449,10 @@ class Crawler:
                 and await self._frontier_drained()
             ):
                 self._done.set()
-                self._wakeup.set()
+                self._wake()
                 return True
+            if self._signals != signals:
+                return self._done.is_set()
             self._wakeup.clear()
             try:
                 async with asyncio.timeout(_IDLE_POLL):
@@ -397,7 +480,7 @@ class Crawler:
             self.stats.leases_reclaimed += reclaimed
             self.metrics.leases_reclaimed.inc(reclaimed)
             log.warning("reclaimed expired leases", extra={"count": reclaimed})
-            self._wakeup.set()
+            self._wake()
         return reclaimed
 
     async def _keep_leases(self) -> None:
@@ -444,6 +527,7 @@ class Crawler:
 
         try:
             async with self.throttle.slot(domain):
+                self._unpaid.pop(id(request), None)
                 self.stats.requests += 1
                 self.metrics.requests.labels(domain).inc()
                 response = await self._fetch(request)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import enum
+import math
+from collections.abc import Collection
 
 from crawlforge.clock import Clock, SystemClock
 
@@ -117,6 +119,26 @@ class BreakerRegistry:
             breaker = CircuitBreaker(self.failure_threshold, self.recovery_timeout, self._clock)
             self._breakers[domain] = breaker
         return breaker
+
+    def blocked(self, busy: Collection[str] = ()) -> dict[str, float]:
+        """Domains whose breaker refuses requests -> seconds until it could admit one.
+
+        ``busy`` are domains with a request in flight. A half-open domain with a request in
+        flight is blocked until that request finishes (``inf``): it is, or will claim, the
+        probe. A probe claimed with nothing in flight was orphaned and is released.
+        """
+        blocked: dict[str, float] = {}
+        for domain, breaker in self._breakers.items():
+            if breaker._state is BreakerState.CLOSED:
+                continue
+            state = breaker.state
+            if state is BreakerState.OPEN:
+                blocked[domain] = breaker.retry_in()
+            elif domain in busy:
+                blocked[domain] = math.inf
+            elif breaker._probe_in_flight:
+                breaker.release_probe()
+        return blocked
 
     def states(self) -> dict[str, BreakerState]:
         return {domain: b.state for domain, b in self._breakers.items()}
