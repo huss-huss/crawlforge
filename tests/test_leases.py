@@ -1,15 +1,13 @@
 """Lease-based Redis pops: several crawlers sharing one frontier (no network).
 
-Every test runs against fakeredis and, when ``TEST_REDIS_URL`` is set, a real Redis.
+Every test runs against fakeredis and, when ``TEST_REDIS_URL`` is set, a real Redis
+(the ``make_queue`` fixture in conftest.py).
 """
 
 import asyncio
-import os
 import time
-import uuid
 from collections import Counter
 
-import fakeredis
 import pytest
 
 from crawlforge import Request, Spider
@@ -20,43 +18,6 @@ from crawlforge.replay import queue_pending
 from test_engine import html, read_jsonl
 
 PAGES = 40
-
-
-@pytest.fixture(params=["fakeredis", "redis"])
-async def make_queue(request):
-    """``make_queue(**kwargs)`` builds RedisQueues that share one server and key prefix."""
-    if request.param == "fakeredis":
-        server = fakeredis.FakeServer()
-
-        def client():
-            return fakeredis.FakeAsyncRedis(server=server)
-
-    else:
-        url = os.environ.get("TEST_REDIS_URL")
-        if not url:
-            pytest.skip("TEST_REDIS_URL not set")
-        from redis.asyncio import Redis
-
-        def client():
-            return Redis.from_url(url)
-
-    prefix = f"crawlforge-test:{uuid.uuid4().hex[:12]}"
-    created = []
-
-    def factory(**kwargs):
-        queue = RedisQueue(client(), prefix=prefix, **kwargs)
-        created.append(queue)
-        return queue
-
-    yield factory
-
-    admin = client()
-    keys = [key async for key in admin.scan_iter(match=f"{prefix}:*")]
-    if keys:
-        await admin.delete(*keys)
-    await admin.aclose()
-    for queue in created:
-        await queue.close()
 
 
 async def eventually(predicate, timeout=5.0):

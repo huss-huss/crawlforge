@@ -1,3 +1,7 @@
+import os
+import uuid
+from contextlib import asynccontextmanager
+
 import fakeredis
 import pytest
 
@@ -14,6 +18,62 @@ async def backend(request):
     queue = RedisQueue(client, prefix="test")
     yield queue
     await queue.close()
+
+
+@asynccontextmanager
+async def redis_queues(kind):
+    """A factory of RedisQueues sharing one (fake or real) server and key prefix."""
+    if kind == "fakeredis":
+        server = fakeredis.FakeServer()
+
+        def client():
+            return fakeredis.FakeAsyncRedis(server=server)
+
+    else:
+        url = os.environ.get("TEST_REDIS_URL")
+        if not url:
+            pytest.skip("TEST_REDIS_URL not set")
+        from redis.asyncio import Redis
+
+        def client():
+            return Redis.from_url(url)
+
+    prefix = f"crawlforge-test:{uuid.uuid4().hex[:12]}"
+    created = []
+
+    def factory(**kwargs):
+        queue = RedisQueue(client(), prefix=prefix, **kwargs)
+        created.append(queue)
+        return queue
+
+    try:
+        yield factory
+    finally:
+        admin = client()
+        keys = [key async for key in admin.scan_iter(match=f"{prefix}:*")]
+        if keys:
+            await admin.delete(*keys)
+        await admin.aclose()
+        for queue in created:
+            await queue.close()
+
+
+@pytest.fixture(params=["fakeredis", "redis"])
+async def make_queue(request):
+    """``make_queue(**kwargs)`` builds RedisQueues that share one server and key prefix."""
+    async with redis_queues(request.param) as factory:
+        yield factory
+
+
+@pytest.fixture(params=["memory", "fakeredis", "redis"])
+async def make_any_queue(request):
+    """``make_any_queue()`` returns queues sharing one state: memory, fakeredis, Redis."""
+    if request.param == "memory":
+        queue = MemoryQueue()
+        yield lambda: queue
+        return
+    async with redis_queues(request.param) as factory:
+        yield factory
 
 
 import httpx  # noqa: E402

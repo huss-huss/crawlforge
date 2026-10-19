@@ -77,3 +77,26 @@ def test_crawl_delay_only_slows_down():
     assert throttle.bucket("a.test").rate == pytest.approx(0.5)
     throttle.apply_crawl_delay("a.test", 0.01)
     assert throttle.bucket("a.test").rate == pytest.approx(0.5)
+
+
+def test_throttled_reports_domains_without_a_token_for_one_more_request():
+    clock = FakeClock()
+    throttle = DomainThrottle(rate=2, burst=2, clock=clock)
+    assert throttle.throttled({}) == {}
+    # One request scheduled but not yet through its slot: a second one still fits the burst.
+    assert throttle.throttled({"a.test": 1}) == {}
+    # Two reserved: the third waits for a refill (0.5 s per token).
+    assert throttle.throttled({"a.test": 2}) == {"a.test": pytest.approx(0.5)}
+
+
+async def test_throttled_tracks_drained_buckets_until_they_refill():
+    clock = FakeClock()
+    throttle = DomainThrottle(rate=4, burst=1, clock=clock)
+    async with throttle.slot("a.test"):
+        pass
+    assert throttle.throttled({}) == {"a.test": pytest.approx(0.25)}
+    clock.advance(0.1)
+    assert throttle.throttled({}) == {"a.test": pytest.approx(0.15)}
+    clock.advance(0.15)
+    assert throttle.throttled({}) == {}
+    assert throttle._drained == set()
