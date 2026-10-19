@@ -335,6 +335,7 @@ class Crawler:
                 return
             signals = self._signals
             async with self._lock:
+                checked = self.clock.monotonic()
                 blocked = self._blocked()
                 delivery = await self.frontier.receive(s.lease_ttl, skip=blocked)
                 if delivery is not None:
@@ -347,7 +348,7 @@ class Crawler:
                         self._leases[key] = delivery.lease
             if delivery is None:
                 if blocked:
-                    await self._wake_when_ready(blocked)
+                    await self._wake_when_ready(blocked, checked)
                 if await self._wait_for_work(signals):
                     return
                 continue
@@ -404,16 +405,23 @@ class Crawler:
             blocked[domain] = max(blocked.get(domain, 0.0), wait)
         return blocked
 
-    async def _wake_when_ready(self, blocked: dict[str, float]) -> None:
-        """Nothing was ready: arm the timer for the first blocked domain that has work."""
+    async def _wake_when_ready(self, blocked: dict[str, float], checked: float) -> None:
+        """Nothing was ready: arm the timer for the first blocked domain that has work.
+
+        ``blocked`` holds waits measured at ``checked``; the queue lookup may take a while
+        (Redis), so the timer is set for that absolute time, not for the wait.
+        """
         timed = [domain for domain, wait in blocked.items() if wait != math.inf]
         if not timed:
             return
         waiting = await self.frontier.backend.queued_domains(timed)
         if not waiting:
             return
-        delay = min(blocked[domain] for domain in waiting)
-        due = self.clock.monotonic() + delay
+        due = checked + min(blocked[domain] for domain in waiting)
+        delay = due - self.clock.monotonic()
+        if delay <= 0:
+            self._wake()  # ready already (another timer got there first)
+            return
         if self._timer is not None and not self._timer.done():
             if self._timer_due <= due:
                 return
