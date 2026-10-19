@@ -340,7 +340,11 @@ round-trip to the site from where it ran):
 | --- | --- | --- | --- | --- | --- |
 | 1050 | 1000 | 0 | 0 | 0 | 275 s |
 
-All 1000 books came out with unique UPCs across 50 categories. That throughput (~3.8 req/s)
+All 1000 books came out with unique UPCs across 50 categories. A re-run on 2026-10-19 with
+per-domain scheduling (same command and settings) gave 1050 requests, 1000 items with unique
+UPCs, no retries or dead letters, in 218 s. It's a single-domain crawl, so the scheduler
+has nothing to interleave there; that run checks for regressions, and the gap to 275 s is
+mostly network variance between the two days (round-trip time wasn't controlled). That throughput (~3.8 req/s)
 is limited by per-domain concurrency × latency, not by the rate limit. It's a deliberate,
 polite default.
 
