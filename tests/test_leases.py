@@ -59,6 +59,14 @@ async def make_queue(request):
         await queue.close()
 
 
+async def eventually(predicate, timeout=5.0):
+    for _ in range(int(timeout / 0.005)):
+        if await predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not met in time")
+
+
 def past(seconds=3600.0):
     """A wall clock running behind: leases it hands out are already expired for others."""
     return lambda: time.time() - seconds
@@ -68,6 +76,14 @@ async def leased_entries(queue):
     """Raw delivery counters by URL (queued or leased entries only)."""
     counts = await queue._redis.hgetall(queue.deliveries_key)
     return {RedisQueue._decode(m).url: int(n) for m, n in counts.items()}
+
+
+async def _at_least(value, n):
+    return await value >= n
+
+
+async def _truthy(value):
+    return bool(value)
 
 
 # ---------------------------------------------------------------------- queue level
@@ -328,8 +344,7 @@ async def test_cancelled_crawl_releases_its_leases(make_crawler, make_queue, tmp
 
     crawler = engine(make_crawler, tmp_path, "a", handler, make_queue())
     task = asyncio.create_task(crawler.run())
-    while await queue.in_flight() < 2:
-        await asyncio.sleep(0.005)
+    await eventually(lambda: _at_least(queue.in_flight(), 2))
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -353,8 +368,7 @@ async def test_graceful_stop_requeues_a_deferred_retry_in_place_of_its_lease(
 
     crawler = engine(make_crawler, tmp_path, "a", handler, make_queue(), clock=SystemClock())
     task = asyncio.create_task(crawler.run())
-    while not crawler._deferred:
-        await asyncio.sleep(0.005)
+    await eventually(lambda: _truthy(crawler._deferred))
     assert await queue.in_flight() == 1  # held while waiting for the retry
     crawler.stop()
     stats = await task
