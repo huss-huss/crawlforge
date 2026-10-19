@@ -57,9 +57,12 @@ lines of library code).
   Spider         |                         Crawler (engine)                       |
   start_requests +--> Frontier ------------------------------------------+        |
   parse()  <-----+    | dedupe (normalized URL fingerprint), max depth   |        |
+    |            |    | one queue per domain + index of domains w/ work  |        |
     |            |    | QueueBackend: MemoryQueue | RedisQueue (leases)  |        |
     |            |    +------------------------+-------------------------+        |
-    |            |                             | pop (N workers)                  |
+    |            |                             | next request of a READY domain   |
+    |            |                             | (N workers; throttled, capped    |
+    |            |                             |  and breaker-open ones skipped)  |
     |            |                             v                                  |
     |            |   robots.txt cache --> circuit breaker --> per-domain slot     |
     |            |   (RFC 9309, per          (per domain:     (semaphore +        |
@@ -94,9 +97,9 @@ Source layout (`src/crawlforge/`):
 
 | Module | Responsibility |
 | --- | --- |
-| `engine.py` | Worker loop, request pipeline, deferral, shutdown, checkpoint capture |
+| `engine.py` | Worker loop, ready-domain scheduling, request pipeline, deferral, shutdown, checkpoint capture |
 | `spider.py`, `http.py` | Public API: `Spider`, `Request`, `Response` (parsel selectors) |
-| `frontier.py`, `queues/` | Dedupe + depth limits; memory and Redis (leasing) priority queues |
+| `frontier.py`, `queues/` | Dedupe + depth limits; memory and Redis (leasing) per-domain priority queues |
 | `url.py` | URL normalization and request fingerprints |
 | `ratelimit.py` | Token bucket, per-domain throttle, robots crawl-delay |
 | `retry.py`, `breaker.py` | Retry classification/backoff, circuit breaker state machine |
@@ -108,11 +111,57 @@ Source layout (`src/crawlforge/`):
 | `replay.py` | DLQ filtering and re-queueing for `crawlforge replay-dlq` |
 | `cli.py` | `crawlforge run`, `crawlforge stats`, `crawlforge replay-dlq` |
 
+## Scheduling
+
+The frontier keeps one priority queue per domain (host, plus the port if it isn't the
+default) and an index of the domains that have queued work. A worker doesn't take "the next
+request"; it takes the next request of a domain it can send to right now. A domain is
+skipped while:
+
+- its token bucket has no token for one more request. Requests already handed out but not yet
+  through their slot count against the bucket, so a burst of 1 means one request at a time is
+  scheduled, not four that then queue up on the bucket;
+- it already has `per_domain_concurrency` requests in flight in this process;
+- its circuit breaker is open, or half-open with its single probe already out.
+
+Skipped domains keep their requests and their place in line. Among the domains that are
+ready, the one whose next request has the highest `priority` goes first; domains tied on
+priority take turns (round-robin: a domain that was just served goes to the back of its
+priority band). Within a domain, higher priority goes first and ties are FIFO, as before.
+So a crawl that doesn't use priorities interleaves its domains evenly, and one that does gets
+the same priority order as before, just without waiting on domains that aren't ready.
+
+When every domain with queued work is blocked, workers don't spin or each sleep: one timer on
+the crawler's clock wakes them when the first blocked domain becomes ready (next token, or the
+end of a breaker's recovery window), and a finished request wakes them when it frees a
+concurrency slot or a probe. An open breaker's requests are never popped just to be put back.
+
+On Redis the same rules run inside the lease scripts. Every domain has its own sorted set
+(`<prefix>:domains:<domain>`) and `<prefix>:domains` is the ready-domain index (domain ->
+priority band of its best request + its turn). `receive` walks the index, skips the domains
+the process passed in, and leases the head of the first other one, in one script. Pushes,
+retries, releases and reclaimed leases update the queue and the index in the same script, so
+two processes never see them disagree. Which domains are blocked is each process's own view
+(see Limitations).
+
+With the fake clock, a crawl of 20 pages on a domain with a 1 s crawl-delay plus 20 pages on
+an unthrottled domain, seeded slow-first, with 4 workers
+(`tests/test_scheduling.py::test_throttled_domain_no_longer_blocks_the_others`):
+
+| scheduler | last fast.test page | fast.test throughput | whole crawl |
+| --- | --- | --- | --- |
+| strict FIFO (the old single queue) | 19.016 s | ~1.05 req/s | 19.016 s |
+| ready domain first | 0.019 s | ~1050 req/s | 19.000 s |
+
+Under FIFO every worker ends up waiting in the slow domain's token bucket and the fast domain
+only starts at 16 s. With per-domain scheduling it finishes before the slow domain's second
+token. The whole crawl takes the same time because the slow domain's crawl-delay bounds it.
+
 ## Design decisions and trade-offs
 
-- **Retries are deferred, not slept.** A request that needs to back off (or that hits an open
-  breaker) is handed to a timer task that re-queues it later. Workers never sit idle inside a
-  `sleep`, so one slow domain can't use up the worker pool with backoff waits.
+- **Retries are deferred, not slept.** A request that needs to back off is handed to a timer
+  task that re-queues it later. Workers never sit idle inside a `sleep`, so one slow domain
+  can't use up the worker pool with backoff waits.
 - **Full-jitter exponential backoff** (`uniform(0, min(cap, base * 2^n))`) spreads retries out
   so they don't arrive at the server in synchronized bursts. When the server sends
   `Retry-After` (seconds or HTTP-date), that value wins, capped at `max_retry_after`.
@@ -146,9 +195,12 @@ Source layout (`src/crawlforge/`):
   queued and its items written. A process that dies mid-request therefore loses nothing: its
   leases expire and another process re-queues them. The price is at-least-once delivery for
   requests whose holder died, the same trade-off as checkpoints.
-- **Head-of-line blocking is accepted.** A worker pops a request and then waits for that
-  domain's slot. With a single domain this costs nothing. With many domains and a tiny global
-  concurrency, one throttled domain can hold workers. Per-domain queues are on the roadmap.
+- **Readiness is checked before the pop, not after.** Workers used to pop the next request and
+  then wait for that domain's slot, so one throttled domain could hold every worker
+  (head-of-line blocking). The engine now passes the domains it can't send to into the pop
+  (see [Scheduling](#scheduling)). The token is still taken at fetch time, so the rate limit
+  and `Crawl-delay` are enforced exactly as before; the check before the pop only decides
+  which domain to serve.
 
 ## Quick start
 
@@ -199,16 +251,17 @@ crawlforge run examples/books.py --queue redis://localhost:6379/0 --sink "postgr
 
 How the work is shared:
 
-- **Leased pops.** A pop atomically moves the request from `crawlforge:<spider>:queue` into
-  `:leases` (lease id -> deadline) and `:inflight` (lease id -> queue entry). No two
-  processes ever get the same entry.
+- **Leased pops.** A pop atomically moves the head of a ready domain's queue
+  (`crawlforge:<spider>:domains:<domain>`) into `:leases` (lease id -> deadline) and
+  `:inflight` (lease id -> queue entry), and updates the `:domains` index. No two processes
+  ever get the same entry.
 - **Ack on completion.** The lease is acked once the request is done: callback run (items
   written, follow-ups queued) or dead-lettered. A retry swaps the lease for the re-queued
   request in one step when its backoff timer fires; until then the lease is held.
 - **Extensions.** Every `lease_ttl / 3` seconds a process extends all leases it holds
   (in-flight and waiting on backoff), so a slow page or a long `Retry-After` keeps its lease.
 - **Reclaim.** The same loop, and any idle process waiting for work, moves expired leases of
-  *any* process back to the queue with their original priority. A crashed or frozen worker's
+  *any* process back to their domain's queue with their original priority. A crashed or frozen worker's
   requests are fetched elsewhere after at most `lease_ttl` seconds.
 - **Delivery limit.** `:deliveries` counts how often an entry was handed out. An entry whose
   lease keeps expiring (a page that crashes or hangs every worker that takes it) goes to the
@@ -318,7 +371,9 @@ class MySpider(Spider):
 
 - `Response` has `.css()`, `.xpath()` (parsel), `.text`, `.json()`, `.urljoin()`, `.follow()`,
   `.status`, `.headers`, `.rendered` and `.request` (with `.depth` and `.meta`).
-- Higher `priority` is fetched first. Depth is set by the engine (parent + 1).
+- Higher `priority` is fetched first among the domains that are ready to be sent to; equal
+  priorities are FIFO within a domain and round-robin across domains. Depth is set by the
+  engine (parent + 1).
 - Items that fail validation go to `rejects.jsonl` with the pydantic error list. A callback
   that raises sends its request to the DLQ with `callback_error:<Type>`, and items it yielded
   before the error are kept.
@@ -355,7 +410,9 @@ creates `T(key TEXT PRIMARY KEY, data JSONB, scraped_at TIMESTAMPTZ)` and upsert
 so a re-crawl updates rows instead of duplicating them.
 
 Queues: `--queue memory` (default) or `--queue redis://host:6379/0`. Keys are namespaced
-`crawlforge:<spider>:{queue,seen,seq,leases,inflight,deliveries}`. A fresh (non-`--resume`)
+`crawlforge:<spider>:{domains,domains:<domain>,queued,turn,seen,seq,leases,inflight,deliveries}`.
+A frontier written by an earlier version (a single `:queue` sorted set) is moved into the
+per-domain queues the first time a process uses it. A fresh (non-`--resume`)
 run clears its own namespace, so only the first process of a shared crawl runs without
 `--resume`. A `--resume` run joins when the queue is non-empty or any lease is outstanding.
 
@@ -378,7 +435,7 @@ Exposed at `http://<host>:<metrics_port>/metrics`:
 | `crawlforge_circuit_breaker_trips_total` | counter | `domain` |
 | `crawlforge_frontier_size` | gauge | |
 | `crawlforge_in_flight` | gauge | |
-| `crawlforge_deferred` | gauge | requests waiting on backoff or an open breaker |
+| `crawlforge_deferred` | gauge | requests waiting on backoff (or on a breaker that opened after they were scheduled) |
 | `crawlforge_leases_reclaimed_total` | counter | expired leases this process put back in a shared queue |
 
 Logs are JSON lines on stderr (`--plain-logs` for human-readable output), with structured
@@ -412,12 +469,15 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/db .venv/bin/pytest -q  
 
 The suite never touches the internet. Engine tests use `httpx.MockTransport` and a
 `FakeClock` whose `sleep` advances virtual time, so backoff, `Retry-After`, breaker recovery
-windows and rate-limiter timing are asserted exactly and run in milliseconds. CLI tests use a
-throwaway HTTP server on `127.0.0.1`. Redis behavior, including the lease Lua scripts, is tested with `fakeredis` (with its `lupa`
-Lua runtime); the lease tests also run against a real Redis when `TEST_REDIS_URL` is set. The real
+windows, rate-limiter timing and the scheduler's throughput gain are asserted exactly and run in
+milliseconds. CLI tests use a
+throwaway HTTP server on `127.0.0.1`. Redis behavior, including the lease and scheduling Lua scripts, is tested with `fakeredis` (with
+its `lupa` Lua runtime); the lease and scheduling tests also run against a real Redis when
+`TEST_REDIS_URL` is set, and a randomized test checks that the Lua scheduler pops in exactly
+the same order as `MemoryQueue`. The real
 browser test runs only where Playwright and Chromium are installed. CI (GitHub Actions) runs
 ruff and pytest on Python 3.12 with the pinned `requirements-ci.txt` and Postgres and Redis
-services, so the Postgres sink test and the real-Redis lease tests run there too.
+services, so the Postgres sink test and the real-Redis lease and scheduling tests run there too.
 
 ## Limitations (v0.1)
 
@@ -430,8 +490,24 @@ services, so the Postgres sink test and the real-Redis lease tests run there too
   sinks may then contain duplicates for those pages; the Postgres sink deduplicates by key.
   A request whose lease expired while its holder was merely slow can be fetched twice too.
 - `max_requests` and `stats.json` are per process; DLQ and rejects files are too.
-- Lease deadlines come from client wall clocks, and the Redis keys of one spider aren't
-  hash-tagged, so Redis Cluster isn't supported.
+- Scheduling decisions are per process too. On a shared Redis frontier each process skips
+  the domains *it* has throttled, capped or broken, and the Lua script walks the domain index
+  past them. A process that has blocked thousands of domains passes them all on each pop, so
+  very wide crawls (many thousands of hot domains per process) pay for that per pop.
+- Priority is respected across domains, so a domain that keeps yielding high-priority
+  requests is served before lower-priority work elsewhere (round-robin only applies among
+  equal priorities). Give requests the same priority if you want strict fairness.
+- A worker counts a request against its domain's concurrency from the pop until it is done,
+  including its robots.txt check, so the first requests of a domain may start slightly later
+  than the semaphore alone would allow.
+- Lease deadlines come from client wall clocks, and the scripts build per-domain key names
+  themselves (and the keys of one spider aren't hash-tagged), so Redis Cluster isn't
+  supported.
+- Upgrading a shared Redis frontier from the single-queue layout: stop the old processes
+  gracefully first (they release their leases). Queued entries are migrated with their
+  domains; a lease left behind by an old process that died is reclaimed into a shared
+  catch-all queue that is scheduled without per-domain readiness (the request is still
+  rate-limited when it is fetched).
 - No HTTP cache, cookie/session management helpers, proxy rotation, or sitemap support.
 - `item_model` is one schema per spider. Yield pydantic instances directly if you need several.
 - Checkpoint files hold the whole frontier and seen set in JSON. That's fine for hundreds of
@@ -446,7 +522,8 @@ services, so the Postgres sink test and the real-Redis lease tests run there too
 
 ## Roadmap
 
-- Per-domain queues to remove head-of-line blocking; adaptive (AutoThrottle-style) rate control
+- Adaptive (AutoThrottle-style) rate control, feeding latency into each domain's bucket and
+  so into the scheduler
 - Shared (Redis-backed) per-domain rate limits and breakers for multi-process crawls;
   Bloom-filter seen set
 - Sitemap and RSS discovery, HTTP caching (ETag/Last-Modified), proxy pools
