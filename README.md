@@ -57,7 +57,7 @@ lines of library code).
   Spider         |                         Crawler (engine)                       |
   start_requests +--> Frontier ------------------------------------------+        |
   parse()  <-----+    | dedupe (normalized URL fingerprint), max depth   |        |
-    |            |    | QueueBackend: MemoryQueue | RedisQueue (zset+set)|        |
+    |            |    | QueueBackend: MemoryQueue | RedisQueue (leases)  |        |
     |            |    +------------------------+-------------------------+        |
     |            |                             | pop (N workers)                  |
     |            |                             v                                  |
@@ -96,7 +96,7 @@ Source layout (`src/crawlforge/`):
 | --- | --- |
 | `engine.py` | Worker loop, request pipeline, deferral, shutdown, checkpoint capture |
 | `spider.py`, `http.py` | Public API: `Spider`, `Request`, `Response` (parsel selectors) |
-| `frontier.py`, `queues/` | Dedupe + depth limits; memory and Redis priority queues |
+| `frontier.py`, `queues/` | Dedupe + depth limits; memory and Redis (leasing) priority queues |
 | `url.py` | URL normalization and request fingerprints |
 | `ratelimit.py` | Token bucket, per-domain throttle, robots crawl-delay |
 | `retry.py`, `breaker.py` | Retry classification/backoff, circuit breaker state machine |
@@ -141,6 +141,11 @@ Source layout (`src/crawlforge/`):
 - **File sinks use plain buffered writes** from the event loop. That's simple and fast enough
   for JSONL/CSV volumes. A crawl producing very large items at very high rates would want a
   writer thread.
+- **Leases, not destructive pops, on Redis.** A Redis pop moves the request into an in-flight
+  set with a deadline (one Lua script), and the worker acks it only after its follow-ups are
+  queued and its items written. A process that dies mid-request therefore loses nothing: its
+  leases expire and another process re-queues them. The price is at-least-once delivery for
+  requests whose holder died, the same trade-off as checkpoints.
 - **Head-of-line blocking is accepted.** A worker pops a request and then waits for that
   domain's slot. With a single domain this costs nothing. With many domains and a tiny global
   concurrency, one throttled domain can hold workers. Per-domain queues are on the roadmap.
@@ -182,6 +187,48 @@ On resume, sinks open in append mode and the stats total both runs. The checkpoi
 once the crawl finishes. Redis-backed crawls can also resume straight from Redis
 (`--queue redis://... --resume`) without a checkpoint file.
 
+### Several processes on one Redis frontier
+
+Any number of crawler processes (on one machine or several) can share a Redis frontier.
+Start the first one normally, then join more with `--resume`:
+
+```bash
+crawlforge run examples/books.py --queue redis://localhost:6379/0 --sink "postgresql://..."
+crawlforge run examples/books.py --queue redis://localhost:6379/0 --sink "postgresql://..." --resume
+```
+
+How the work is shared:
+
+- **Leased pops.** A pop atomically moves the request from `crawlforge:<spider>:queue` into
+  `:leases` (lease id -> deadline) and `:inflight` (lease id -> queue entry). No two
+  processes ever get the same entry.
+- **Ack on completion.** The lease is acked once the request is done: callback run (items
+  written, follow-ups queued) or dead-lettered. A retry swaps the lease for the re-queued
+  request in one step when its backoff timer fires; until then the lease is held.
+- **Extensions.** Every `lease_ttl / 3` seconds a process extends all leases it holds
+  (in-flight and waiting on backoff), so a slow page or a long `Retry-After` keeps its lease.
+- **Reclaim.** The same loop, and any idle process waiting for work, moves expired leases of
+  *any* process back to the queue with their original priority. A crashed or frozen worker's
+  requests are fetched elsewhere after at most `lease_ttl` seconds.
+- **Delivery limit.** `:deliveries` counts how often an entry was handed out. An entry whose
+  lease keeps expiring (a page that crashes or hangs every worker that takes it) goes to the
+  DLQ as `lease_expired_too_often` when it would be handed out more than `max_deliveries`
+  times.
+- **Shared seen set.** Fingerprints are added to `:seen` atomically when a request is
+  queued, so two processes never enqueue the same URL twice.
+- **Graceful shutdown** (Ctrl-C, `max_requests`, cancel) releases this process's leases at
+  once. A released request goes back to its place in the queue and doesn't count as a
+  delivery; a request waiting on a retry goes back with its updated retry count.
+- **Finishing.** A process stops when the queue is empty *and* no process holds a lease, so
+  the last workers don't quit while another one may still yield follow-ups.
+
+Tune with `--set lease_ttl=60` (seconds, default 60; keep it above your slowest request plus
+a margin, since a lease is only extended every third of it) and `--set max_deliveries=3`.
+Every process writes its own `dlq.jsonl`, `rejects.jsonl` and `stats.json`, so give each one
+its own `--output-dir`, and use a sink that can take concurrent writers (Postgres) or one file
+per process. Lease deadlines use each client's wall clock, so keep the machines' clocks in
+sync (NTP).
+
 ### Replaying dead letters
 
 Requests that failed permanently land in `dlq.jsonl` with their reason (`http_404`,
@@ -213,7 +260,7 @@ next: crawlforge run <spider.py> --checkpoint .crawlforge/books.ckpt.json --resu
 | `--limit N` | Replay at most `N` entries (oldest first) |
 | `--dry-run` | Print the entries that would be replayed and change nothing |
 | `--checkpoint PATH` | Append to this checkpoint's pending requests; it is created if the crawl already finished and removed it |
-| `--queue redis://...` | Push onto the spider's Redis queue instead (used when no checkpoint file exists, same precedence as `run --resume`) |
+| `--queue redis://...` | Push onto the spider's Redis queue instead (used when no checkpoint file exists, same precedence as `run --resume`); requests queued or leased by a running process count as already queued |
 | `--spider NAME` | The spider's `name`; needed for Redis keys and for new checkpoints (an existing checkpoint names its own spider) |
 
 All filters must match. Replayed requests keep their URL, callback, meta, priority and depth
@@ -295,6 +342,7 @@ Precedence: defaults < `Spider.custom_settings` < CLI flags / `--set key=value`.
 | `max_retry_after` | `300` | Upper bound for honoring `Retry-After` |
 | `breaker_threshold` / `breaker_recovery` | `5` / `30` | Consecutive failures to open; seconds until the probe |
 | `max_depth` / `max_requests` | unset | Scope limits (`max_requests` stops gracefully and checkpoints) |
+| `lease_ttl` / `max_deliveries` | `60` / `3` | Leasing queues (Redis): seconds a lease lasts without an extension; times a request may be handed out before it is dead-lettered (`lease_expired_too_often`) |
 | `handle_statuses` | `[]` | Error statuses passed to callbacks instead of the DLQ |
 | `render_concurrency` | `2` | Concurrent browser pages |
 | `output_dir` | `.crawlforge` | Default location of `dlq.jsonl`, `rejects.jsonl`, `stats.json` |
@@ -307,7 +355,9 @@ creates `T(key TEXT PRIMARY KEY, data JSONB, scraped_at TIMESTAMPTZ)` and upsert
 so a re-crawl updates rows instead of duplicating them.
 
 Queues: `--queue memory` (default) or `--queue redis://host:6379/0`. Keys are namespaced
-`crawlforge:<spider>:{queue,seen,seq}`. A fresh (non-`--resume`) run clears its own namespace.
+`crawlforge:<spider>:{queue,seen,seq,leases,inflight,deliveries}`. A fresh (non-`--resume`)
+run clears its own namespace, so only the first process of a shared crawl runs without
+`--resume`. A `--resume` run joins when the queue is non-empty or any lease is outstanding.
 
 ## Metrics
 
@@ -329,6 +379,7 @@ Exposed at `http://<host>:<metrics_port>/metrics`:
 | `crawlforge_frontier_size` | gauge | |
 | `crawlforge_in_flight` | gauge | |
 | `crawlforge_deferred` | gauge | requests waiting on backoff or an open breaker |
+| `crawlforge_leases_reclaimed_total` | counter | expired leases this process put back in a shared queue |
 
 Logs are JSON lines on stderr (`--plain-logs` for human-readable output), with structured
 fields such as `url`, `status`, `reason`, `attempt` and `delay`. A `progress` line is logged
@@ -362,19 +413,25 @@ TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/db .venv/bin/pytest -q  
 The suite never touches the internet. Engine tests use `httpx.MockTransport` and a
 `FakeClock` whose `sleep` advances virtual time, so backoff, `Retry-After`, breaker recovery
 windows and rate-limiter timing are asserted exactly and run in milliseconds. CLI tests use a
-throwaway HTTP server on `127.0.0.1`. Redis behavior is tested with `fakeredis`. The real
+throwaway HTTP server on `127.0.0.1`. Redis behavior, including the lease Lua scripts, is tested with `fakeredis` (with its `lupa`
+Lua runtime); the lease tests also run against a real Redis when `TEST_REDIS_URL` is set. The real
 browser test runs only where Playwright and Chromium are installed. CI (GitHub Actions) runs
-ruff and pytest on Python 3.12 with the pinned `requirements-ci.txt` and a Postgres service,
-so the Postgres sink test runs there too.
+ruff and pytest on Python 3.12 with the pinned `requirements-ci.txt` and Postgres and Redis
+services, so the Postgres sink test and the real-Redis lease tests run there too.
 
 ## Limitations (v0.1)
 
-- Single process. The Redis backend makes the frontier persistent and shareable, but there's
-  no coordination for running several crawler processes against it at once (no lease or
-  visibility timeout for popped requests).
-- Requests that are in flight when the process is killed hard are re-fetched on resume
-  (at-least-once for those pages). File sinks may then contain duplicates for those pages; the
-  Postgres sink deduplicates by key.
+- Multi-process crawls need the Redis backend. Politeness is per process: rate limits,
+  per-domain concurrency, circuit breakers and robots.txt caches are not shared, so N
+  processes send up to N times the configured rate to a domain. Divide `rate_per_domain` by
+  the number of processes.
+- Requests that are in flight when a process is killed hard are fetched again: on resume with
+  checkpoints, or by another process once their lease expires (up to `lease_ttl` later). File
+  sinks may then contain duplicates for those pages; the Postgres sink deduplicates by key.
+  A request whose lease expired while its holder was merely slow can be fetched twice too.
+- `max_requests` and `stats.json` are per process; DLQ and rejects files are too.
+- Lease deadlines come from client wall clocks, and the Redis keys of one spider aren't
+  hash-tagged, so Redis Cluster isn't supported.
 - No HTTP cache, cookie/session management helpers, proxy rotation, or sitemap support.
 - `item_model` is one schema per spider. Yield pydantic instances directly if you need several.
 - Checkpoint files hold the whole frontier and seen set in JSON. That's fine for hundreds of
@@ -383,13 +440,15 @@ so the Postgres sink test runs there too.
   timeouts are mapped to retryable errors, but it has no request interception or resource
   blocking yet.
 - `docker-compose.yml` is checked with `docker compose config`, but the stack wasn't brought up
-  during development (no Docker daemon was available). The Redis queue is tested only against
-  fakeredis, and the Postgres sink against a real local PostgreSQL 17.
+  during development (no Docker daemon was available). Locally the Redis queue was tested
+  against fakeredis and the Postgres sink against a real PostgreSQL 17; CI runs the lease
+  tests against a real Redis 7 service as well.
 
 ## Roadmap
 
 - Per-domain queues to remove head-of-line blocking; adaptive (AutoThrottle-style) rate control
-- Lease-based Redis pops for multi-process crawls; Bloom-filter seen set
+- Shared (Redis-backed) per-domain rate limits and breakers for multi-process crawls;
+  Bloom-filter seen set
 - Sitemap and RSS discovery, HTTP caching (ETag/Last-Modified), proxy pools
 - Grafana dashboard JSON next to the Prometheus config
 - Parquet and S3 sinks; item pipelines (transform/enrich) before sinks

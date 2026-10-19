@@ -217,6 +217,16 @@ async def _replay_to_queue(spec: str, spider: str, requests: list[Any]) -> None:
         await backend.close()
 
 
+async def _queue_pending(spec: str, spider: str) -> set[str]:
+    from crawlforge.replay import queue_pending
+
+    backend = queue_from_spec(spec, prefix=f"crawlforge:{spider}")
+    try:
+        return await queue_pending(backend)
+    finally:
+        await backend.close()
+
+
 @app.command("replay-dlq")
 def replay_dlq(
     dlq: Annotated[Path, typer.Option(help="Dead-letter file written by a run.")] = Path(
@@ -304,7 +314,10 @@ def replay_dlq(
 
     lines = read_dlq(dlq)
     try:
-        queued = checkpoint_pending(ckpt, spider) if use_checkpoint and ckpt else set()
+        if use_checkpoint:
+            queued = checkpoint_pending(ckpt, spider) if ckpt else set()
+        else:
+            queued = asyncio.run(_queue_pending(queue, spider))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     plan = plan_replay(lines, flt, limit=limit, queued=queued)

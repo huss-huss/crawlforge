@@ -8,6 +8,12 @@ Request lifecycle::
 
 Retries and requests refused by an open breaker are *deferred*: a timer task re-queues
 them later, so a worker is never parked on a backoff sleep.
+
+With a leasing backend (Redis) every popped request is leased: the lease is extended while
+the request is processed or deferred, acked once it is done (callback run, or dead-lettered),
+swapped for the re-queued request when a retry fires, and released on shutdown. Expired
+leases of any process are swept back into the queue, so several processes can share one
+frontier.
 """
 
 from __future__ import annotations
@@ -99,6 +105,10 @@ class Crawler:
         self.rejects = RejectsSink(JsonlSink(s.resolved("rejects"), append=append))
 
         self._active: dict[int, Request] = {}
+        # Lease ids of requests this process holds (active or deferred), by id(request).
+        self._leases: dict[int, str] = {}
+        # Held leases another process reclaimed; kept so a late ack/requeue is a no-op.
+        self._lost: set[str] = set()
         self._deferred: dict[asyncio.Task[None], Request] = {}
         self._crawl_delay_checked: set[str] = set()
         self._dispatched = 0
@@ -137,6 +147,8 @@ class Crawler:
         try:
             await self._seed()
             background.append(asyncio.create_task(self._monitor()))
+            if self.frontier.backend.leasing:
+                background.append(asyncio.create_task(self._keep_leases()))
             workers = [asyncio.create_task(self._worker()) for _ in range(s.concurrency)]
             try:
                 await asyncio.gather(*workers)
@@ -179,10 +191,17 @@ class Crawler:
                 },
             )
             return
-        if s.resume and backend.persistent and await backend.size() > 0:
-            self.stats.resumed = True
-            log.info("resumed from persistent queue", extra={"pending": await backend.size()})
-            return
+        if s.resume and backend.persistent:
+            # Leased requests count too: another process may still be working (or have died
+            # holding leases that will expire), and clearing would wipe its frontier.
+            pending, in_flight = await backend.size(), await backend.in_flight()
+            if pending or in_flight:
+                self.stats.resumed = True
+                log.info(
+                    "resumed from persistent queue",
+                    extra={"pending": pending, "in_flight": in_flight},
+                )
+                return
         if s.resume:
             log.info("nothing to resume; starting fresh")
         await backend.clear()
@@ -201,11 +220,25 @@ class Crawler:
         for task, _ in leftovers:
             task.cancel()
         await asyncio.gather(*(t for t, _ in leftovers), return_exceptions=True)
+        backend = self.frontier.backend
         async with self._lock:
-            for request in [*self._active.values(), *(r for _, r in leftovers)]:
-                await self.frontier.push(request, force=True)
+            # Deferred requests carry an updated retry count: swap them in for their lease.
+            for _, request in leftovers:
+                await backend.requeue(self._leases.pop(id(request), None), request)
+            active = list(self._active.items())
+            if backend.leasing:
+                # Released right away (not left to expire), without counting as a delivery.
+                leases = [self._leases.pop(key) for key, _ in active if key in self._leases]
+                released = await backend.release(leases)
+                if released:
+                    log.info("released leases", extra={"count": released})
+            else:
+                for _, request in active:
+                    await self.frontier.push(request, force=True)
             self._active.clear()
             self._deferred.clear()
+            self._leases.clear()
+            self._lost.clear()
 
         remaining = await self.frontier.size()
         if error is not None:
@@ -254,11 +287,16 @@ class Crawler:
         return result
 
     def _defer(self, request: Request, delay: float) -> None:
+        """Re-queue ``request`` after ``delay``. Its lease (if any) is held until then."""
+
         async def requeue() -> None:
             await self.clock.sleep(delay)
             async with self._lock:
                 self._deferred.pop(task, None)
-                await self.frontier.push(request, force=True)
+                lease = self._leases.pop(id(request), None)
+                if not await self.frontier.backend.requeue(lease, request):
+                    self._lease_lost(request, lease)
+                self._lost.discard(lease or "")
             self._wakeup.set()
 
         task = asyncio.create_task(requeue())
@@ -272,24 +310,52 @@ class Crawler:
                 self.stop("max_requests")
                 return
             async with self._lock:
-                request = await self.frontier.pop()
-                if request is not None:
+                delivery = await self.frontier.receive(s.lease_ttl)
+                if delivery is not None:
                     self._dispatched += 1
+                    request = delivery.request
                     key = id(request)
                     self._active[key] = request
-            if request is None:
+                    if delivery.lease is not None:
+                        self._leases[key] = delivery.lease
+            if delivery is None:
                 if await self._wait_for_work():
                     return
                 continue
             try:
-                await self._process(request)
+                if delivery.deliveries > s.max_deliveries:
+                    # Every earlier holder let the lease expire (crash, hang, OOM kill...).
+                    await self._dead_letter(request, "lease_expired_too_often")
+                else:
+                    await self._process(request)
             except asyncio.CancelledError:
                 # Leave it in _active: _shutdown re-queues it for the checkpoint.
                 raise
             except Exception as exc:
                 log.exception("internal error processing request", extra={"url": request.url})
                 await self._dead_letter(request, "internal_error", error=repr(exc))
+            await self._settle(key, request)
+
+    async def _settle(self, key: int, request: Request) -> None:
+        """Done with a popped request: ack its lease unless a timer now owns it (deferred)."""
+        async with self._lock:
             self._active.pop(key, None)
+            if any(r is request for r in self._deferred.values()):
+                return
+            lease = self._leases.pop(key, None)
+            if lease is not None:
+                if not await self.frontier.backend.ack(lease):
+                    self._lease_lost(request, lease)
+                self._lost.discard(lease)
+
+    def _lease_lost(self, request: Request, lease: str | None) -> None:
+        # The lease expired and another process reclaimed it; the request will be (or was)
+        # fetched again there. Lease TTL too short for the slowest requests?
+        if lease is None or lease in self._lost:
+            return
+        self._lost.add(lease)
+        self.stats.leases_lost += 1
+        log.warning("lease lost", extra={"url": request.url, "lease_ttl": self.settings.lease_ttl})
 
     async def _wait_for_work(self) -> bool:
         """Idle until new work may exist. Returns True when the crawl is complete."""
@@ -299,7 +365,7 @@ class Crawler:
                 self._idle == self.settings.concurrency
                 and not self._active
                 and not self._deferred
-                and await self.frontier.size() == 0
+                and await self._frontier_drained()
             ):
                 self._done.set()
                 self._wakeup.set()
@@ -313,6 +379,44 @@ class Crawler:
             return self._done.is_set()
         finally:
             self._idle -= 1
+
+    async def _frontier_drained(self) -> bool:
+        if await self.frontier.size() > 0:
+            return False
+        backend = self.frontier.backend
+        if not backend.leasing:
+            return True
+        # Other processes may still yield follow-ups, or have died with expired leases.
+        if await self._reclaim():
+            return False
+        return await backend.in_flight() == 0
+
+    async def _reclaim(self) -> int:
+        reclaimed = await self.frontier.backend.reclaim()
+        if reclaimed:
+            self.stats.leases_reclaimed += reclaimed
+            self.metrics.leases_reclaimed.inc(reclaimed)
+            log.warning("reclaimed expired leases", extra={"count": reclaimed})
+            self._wakeup.set()
+        return reclaimed
+
+    async def _keep_leases(self) -> None:
+        """Extend this process's leases and sweep expired ones, every third of the TTL."""
+        ttl = self.settings.lease_ttl
+        backend = self.frontier.backend
+        while True:
+            await asyncio.sleep(ttl / 3)
+            async with self._lock:
+                held = {v: k for k, v in self._leases.items() if v not in self._lost}
+                lost = await backend.extend(held, ttl)
+            for lease in lost:
+                key = held[lease]
+                request = self._active.get(key) or next(
+                    (r for r in self._deferred.values() if id(r) == key), None
+                )
+                if request is not None:
+                    self._lease_lost(request, lease)
+            await self._reclaim()
 
     # ------------------------------------------------------------------ request pipeline
 
@@ -543,7 +647,9 @@ class Crawler:
         if self.checkpoint is None:
             return
         async with self._lock:
-            extra = [r.to_dict() for r in (*self._active.values(), *self._deferred.values())]
+            held = (*self._active.values(), *self._deferred.values())
+            # Leased requests are already in a leasing backend's snapshot.
+            extra = [r.to_dict() for r in held if id(r) not in self._leases]
             snapshot = await self.frontier.backend.snapshot()
         snapshot["pending"] = snapshot["pending"] + extra
         stats = self.stats.to_dict()

@@ -9,8 +9,9 @@ budget and pushes them into the place the next ``crawlforge run --resume`` reads
   added to ``seen`` so links back to them stay de-duplicated. If the file does not exist
   (the crawl finished and removed it), a checkpoint holding only the replayed requests is
   created;
-- a Redis queue: requests are pushed straight onto the sorted set (again without a dedupe
-  check) and their fingerprints are added to the seen set.
+- a Redis queue: requests are pushed straight onto the queue sorted set (again without a
+  dedupe check) and their fingerprints are added to the seen set. Requests that are queued
+  or leased (in flight in a running process) count as already pending.
 
 Replayed entries are marked in the DLQ file with ``replayed_at`` (the file is rewritten
 atomically), so replaying twice never queues the same entry twice. Failing again after a
@@ -219,6 +220,12 @@ def replay_into_checkpoint(checkpoint: Checkpoint, spider: str, requests: list[R
         "seen": sorted(seen),
     }
     checkpoint.save(spider=spider, frontier=frontier, stats=stats)
+
+
+async def queue_pending(backend: QueueBackend) -> set[str]:
+    """Fingerprints of requests queued or in flight (leased) in a persistent backend."""
+    snapshot = await backend.snapshot()
+    return {Request.from_dict(p).fingerprint for p in snapshot["pending"]}
 
 
 async def replay_into_queue(backend: QueueBackend, requests: list[Request]) -> None:
