@@ -66,6 +66,11 @@ class Metrics:
         self.deferred = Gauge(
             "crawlforge_deferred", "Requests waiting on backoff or an open breaker.", registry=r
         )
+        self.leases_reclaimed = Counter(
+            "crawlforge_leases_reclaimed",
+            "Expired leases (of any process) put back in a shared queue by this one.",
+            registry=r,
+        )
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

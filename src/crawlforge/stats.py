@@ -26,6 +26,8 @@ class CrawlStats:
     callback_errors: int = 0
     sink_errors: int = 0
     breaker_trips: int = 0
+    leases_reclaimed: int = 0
+    leases_lost: int = 0
     status_counts: Counter[str] = field(default_factory=Counter)
     started_at: str | None = None
     finished_at: str | None = None

@@ -39,6 +39,14 @@ class Settings(BaseModel):
     breaker_threshold: int = Field(5, ge=1)
     breaker_recovery: float = Field(30.0, ge=0)
 
+    # Shared (leasing) queues, e.g. Redis with several crawler processes
+    lease_ttl: float = Field(
+        60.0, gt=0, description="Seconds a popped request stays leased without an extension."
+    )
+    max_deliveries: int = Field(
+        3, ge=1, description="Times a request may be leased out before it is dead-lettered."
+    )
+
     # Scope
     max_depth: int | None = Field(None, ge=0)
     max_requests: int | None = Field(None, ge=1, description="Stop after N dispatched requests.")

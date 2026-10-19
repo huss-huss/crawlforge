@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 
 from crawlforge.http import Request
-from crawlforge.queues.base import QueueBackend
+from crawlforge.queues.base import Delivery, QueueBackend
 
 
 class PushResult(enum.Enum):
@@ -35,6 +35,10 @@ class Frontier:
 
     async def pop(self) -> Request | None:
         return await self.backend.pop()
+
+    async def receive(self, lease_ttl: float) -> Delivery | None:
+        """Pop for processing; leasing backends hold the request until it is settled."""
+        return await self.backend.receive(lease_ttl)
 
     async def size(self) -> int:
         return await self.backend.size()
