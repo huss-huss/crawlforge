@@ -105,7 +105,8 @@ Source layout (`src/crawlforge/`):
 | `sinks/`, `deadletter.py` | JSONL / CSV / Postgres sinks, DLQ and rejects writers |
 | `checkpoint.py`, `stats.py` | Atomic checkpoint files, run statistics |
 | `metrics.py`, `logs.py` | Prometheus registry, JSON log formatter |
-| `cli.py` | `crawlforge run`, `crawlforge stats` |
+| `replay.py` | DLQ filtering and re-queueing for `crawlforge replay-dlq` |
+| `cli.py` | `crawlforge run`, `crawlforge stats`, `crawlforge replay-dlq` |
 
 ## Design decisions and trade-offs
 
@@ -180,6 +181,54 @@ crawlforge run examples/books.py --sink jsonl:out/books.jsonl --checkpoint .craw
 On resume, sinks open in append mode and the stats total both runs. The checkpoint is deleted
 once the crawl finishes. Redis-backed crawls can also resume straight from Redis
 (`--queue redis://... --resume`) without a checkpoint file.
+
+### Replaying dead letters
+
+Requests that failed permanently land in `dlq.jsonl` with their reason (`http_404`,
+`max_retries_exceeded:http_503`, `fetch_error:ConnectError`, `callback_error:KeyError`, ...).
+After fixing the cause, put them back into the frontier and resume:
+
+```bash
+crawlforge replay-dlq --checkpoint .crawlforge/books.ckpt.json --spider books \
+  --reason http_503 --dry-run                                   # list what would be replayed
+crawlforge replay-dlq --checkpoint .crawlforge/books.ckpt.json --spider books --reason http_503
+crawlforge run examples/books.py --sink jsonl:out/books.jsonl \
+  --checkpoint .crawlforge/books.ckpt.json --resume
+```
+
+```
+entries   12
+matched   9
+replayed  9 -> checkpoint:.crawlforge/books.ckpt.json
+skipped   0
+next: crawlforge run <spider.py> --checkpoint .crawlforge/books.ckpt.json --resume
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--dlq PATH` | Dead-letter file (default `.crawlforge/dlq.jsonl`) |
+| `--reason TEXT` | Reason contains `TEXT`; with `--regex`, `TEXT` is a regular expression (`re.search`) |
+| `--domain HOST` | Request host is `HOST` or a subdomain of it, port ignored (repeatable) |
+| `--since WHEN` | Dead-lettered at or after an ISO 8601 time (UTC if naive) or a duration ago (`30m`, `2h`, `7d`) |
+| `--limit N` | Replay at most `N` entries (oldest first) |
+| `--dry-run` | Print the entries that would be replayed and change nothing |
+| `--checkpoint PATH` | Append to this checkpoint's pending requests; it is created if the crawl already finished and removed it |
+| `--queue redis://...` | Push onto the spider's Redis queue instead (used when no checkpoint file exists, same precedence as `run --resume`) |
+| `--spider NAME` | The spider's `name`; needed for Redis keys and for new checkpoints (an existing checkpoint names its own spider) |
+
+All filters must match. Replayed requests keep their URL, callback, meta, priority and depth
+and get a fresh retry budget. They go in as pending requests, so they skip the seen-set check
+that would otherwise drop them as duplicates. Their fingerprints are still added to the seen
+set, so links back to them stay de-duplicated, and every other URL is filtered as usual.
+
+Replayed entries stay in the DLQ, marked with `replayed_at` and `replayed_to` (the file is
+rewritten atomically). Running the same command again matches them but replays nothing
+(`skipped 9 (already replayed: 9)`), and entries whose request is already pending in the
+checkpoint are skipped too. If a replayed request fails again, the resumed run appends a new,
+unmarked entry that can be replayed later. Run `replay-dlq` while the crawl is stopped: a
+running crawl rewrites its checkpoint and would drop the replayed requests. When the
+checkpoint is created from scratch (the crawl had finished), it holds only the replayed
+requests, so links they yield to pages crawled before are fetched again.
 
 ### Real run (books.toscrape.com)
 
@@ -340,7 +389,6 @@ so the Postgres sink test runs there too.
 ## Roadmap
 
 - Per-domain queues to remove head-of-line blocking; adaptive (AutoThrottle-style) rate control
-- `crawlforge replay-dlq` to re-queue dead letters after a fix
 - Lease-based Redis pops for multi-process crawls; Bloom-filter seen set
 - Sitemap and RSS discovery, HTTP caching (ETag/Last-Modified), proxy pools
 - Grafana dashboard JSON next to the Prometheus config
