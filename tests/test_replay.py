@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 
@@ -28,6 +29,11 @@ def write_dlq(path, entries, *, raw=()):
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps(e) for e in entries] + list(raw)
     path.write_text("\n".join(lines) + "\n")
+
+
+def squashed(output):
+    """Error text with ANSI codes, Rich box borders and line wrapping removed."""
+    return re.sub(r"\x1b\[[0-9;]*m|[\s│╭╮╰╯─]", "", output)
 
 
 def replay(*args):
@@ -170,7 +176,7 @@ def test_replay_appends_to_existing_checkpoint_of_same_spider(tmp_path):
         frontier={"pending": [stopped], "seen": ["abc"]},
         stats={"requests": 7},
     )
-    assert replay("--dlq", dlq, "--checkpoint", ckpt, "--spider", "other").exit_code != 0
+    assert replay("--dlq", dlq, "--checkpoint", ckpt, "--spider", "other").exit_code == 2
 
     result = replay("--dlq", dlq, "--checkpoint", ckpt)  # spider taken from the checkpoint
     assert result.exit_code == 0, result.output
@@ -184,12 +190,12 @@ def test_replay_requires_a_persistent_target(tmp_path):
     dlq = tmp_path / "dlq.jsonl"
     write_dlq(dlq, SAMPLE)
     result = replay("--dlq", dlq, "--spider", "catalog")
-    assert result.exit_code != 0 and "memory queue" in result.output
+    assert result.exit_code == 2 and "thememoryqueue" in squashed(result.output)
     no_spider = replay("--dlq", dlq, "--checkpoint", tmp_path / "new.json")
-    assert no_spider.exit_code != 0 and "--spider" in no_spider.output
+    assert no_spider.exit_code == 2 and "--spiderisrequired" in squashed(no_spider.output)
     assert replay("--dlq", tmp_path / "missing.jsonl").exit_code == 1
     bad = replay("--dlq", dlq, "--checkpoint", tmp_path / "c.json", "-s", "x", "--since", "soon")
-    assert bad.exit_code != 0 and "invalid --since" in bad.output
+    assert bad.exit_code == 2 and "invalid--since" in squashed(bad.output)
 
 
 # ------------------------------------------------------------------ end to end
