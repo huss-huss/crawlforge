@@ -1,4 +1,4 @@
-"""Command-line interface: ``crawlforge run`` and ``crawlforge stats``."""
+"""Command-line interface: ``crawlforge run``, ``stats`` and ``replay-dlq``."""
 
 from __future__ import annotations
 
@@ -205,6 +205,140 @@ def stats(
         if isinstance(value, dict):
             value = ", ".join(f"{k}: {v}" for k, v in value.items()) or "-"
         typer.echo(f"{key:<{width}}  {value}")
+
+
+async def _replay_to_queue(spec: str, spider: str, requests: list[Any]) -> None:
+    from crawlforge.replay import replay_into_queue
+
+    backend = queue_from_spec(spec, prefix=f"crawlforge:{spider}")
+    try:
+        await replay_into_queue(backend, requests)
+    finally:
+        await backend.close()
+
+
+@app.command("replay-dlq")
+def replay_dlq(
+    dlq: Annotated[Path, typer.Option(help="Dead-letter file written by a run.")] = Path(
+        ".crawlforge/dlq.jsonl"
+    ),
+    checkpoint: Annotated[
+        Path | None, typer.Option(help="Checkpoint to re-queue into (created if missing).")
+    ] = None,
+    queue: Annotated[
+        str, typer.Option(help="redis:// URL to re-queue into (when no checkpoint file).")
+    ] = "memory",
+    spider: Annotated[
+        str | None,
+        typer.Option(
+            "--spider", "-s", help="Spider name (Redis namespace / new checkpoint owner)."
+        ),
+    ] = None,
+    reason: Annotated[
+        str | None, typer.Option(help="Only entries whose reason contains this text.")
+    ] = None,
+    regex: Annotated[bool, typer.Option(help="Treat --reason as a regular expression.")] = False,
+    domain: Annotated[
+        list[str] | None, typer.Option(help="Only this domain and its subdomains (repeatable).")
+    ] = None,
+    since: Annotated[
+        str | None, typer.Option(help="Only entries since an ISO time or a duration (2h, 7d).")
+    ] = None,
+    limit: Annotated[int | None, typer.Option(min=1, help="Replay at most N entries.")] = None,
+    dry_run: Annotated[bool, typer.Option(help="Show what would be replayed; change nothing.")] = (
+        False
+    ),
+) -> None:
+    """Re-queue dead letters so the next `run --resume` fetches them again."""
+    import re
+
+    from crawlforge.checkpoint import Checkpoint
+    from crawlforge.replay import (
+        DlqFilter,
+        checkpoint_pending,
+        mark_replayed,
+        parse_since,
+        plan_replay,
+        read_dlq,
+        replay_into_checkpoint,
+        replay_request,
+        write_dlq,
+    )
+
+    if not dlq.exists():
+        typer.echo(f"no dead-letter file at {dlq}; pass --dlq", err=True)
+        raise typer.Exit(1)
+    try:
+        flt = DlqFilter(
+            reason=reason,
+            regex=regex,
+            domains=domain or [],
+            since=parse_since(since) if since else None,
+        )
+    except re.error as exc:
+        raise typer.BadParameter(f"invalid --reason regex: {exc}") from None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+    # Same precedence as `run --resume`: an existing checkpoint file wins over Redis state.
+    ckpt = Checkpoint(checkpoint) if checkpoint else None
+    use_checkpoint = ckpt is not None and (ckpt.exists() or queue in ("", "memory"))
+    if not use_checkpoint and queue in ("", "memory"):
+        raise typer.BadParameter(
+            "the memory queue does not outlive a run; pass --checkpoint or a redis:// --queue"
+        )
+    if use_checkpoint:
+        assert ckpt is not None
+        if ckpt.exists():
+            owner = json.loads(ckpt.path.read_text(encoding="utf-8")).get("spider")
+            if spider is not None and spider != owner:
+                raise typer.BadParameter(
+                    f"checkpoint {ckpt.path} belongs to spider {owner!r}, not {spider!r}"
+                )
+            spider = owner
+        target = f"checkpoint:{ckpt.path}"
+    else:
+        target = f"queue:{queue}"
+    if not spider:
+        raise typer.BadParameter("--spider is required to create a checkpoint or use Redis")
+
+    lines = read_dlq(dlq)
+    try:
+        queued = checkpoint_pending(ckpt, spider) if use_checkpoint and ckpt else set()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    plan = plan_replay(lines, flt, limit=limit, queued=queued)
+
+    if dry_run:
+        for line in plan.selected:
+            assert line.entry is not None and line.request is not None
+            typer.echo(f"would replay  {line.entry.get('reason')}  {line.request.url}")
+    else:
+        requests = [replay_request(line) for line in plan.selected]
+        if requests:
+            if use_checkpoint:
+                assert ckpt is not None
+                replay_into_checkpoint(ckpt, spider, requests)
+            else:
+                asyncio.run(_replay_to_queue(queue, spider, requests))
+        if plan.selected or plan.covered:
+            mark_replayed([*plan.selected, *plan.covered], target)
+            write_dlq(dlq, lines)
+
+    verb = "to replay" if dry_run else "replayed"
+    skipped = sum(plan.skipped.values())
+    detail = ", ".join(f"{k}: {v}" for k, v in sorted(plan.skipped.items()))
+    typer.echo(
+        f"entries   {plan.total}" + (f" ({plan.unreadable} unreadable)" if plan.unreadable else "")
+    )
+    typer.echo(f"matched   {len(plan.matched)}")
+    typer.echo(f"{verb:<9} {len(plan.selected)} -> {target}")
+    typer.echo(f"skipped   {skipped}" + (f" ({detail})" if detail else ""))
+    if dry_run:
+        typer.echo("dry run: nothing was changed")
+    elif plan.selected:
+        where = f"--checkpoint {ckpt.path}" if use_checkpoint and ckpt else f"--queue {queue}"
+        typer.echo(f"next: crawlforge run <spider.py> {where} --resume")
 
 
 @app.command()
