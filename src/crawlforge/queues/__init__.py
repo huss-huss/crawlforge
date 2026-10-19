@@ -1,4 +1,4 @@
-from crawlforge.queues.base import FrontierSnapshot, QueueBackend
+from crawlforge.queues.base import Delivery, FrontierSnapshot, QueueBackend
 from crawlforge.queues.memory import MemoryQueue
 
 
@@ -13,4 +13,4 @@ def queue_from_spec(spec: str, prefix: str = "crawlforge") -> QueueBackend:
     raise ValueError(f"unknown queue backend: {spec!r} (use 'memory' or a redis:// URL)")
 
 
-__all__ = ["FrontierSnapshot", "MemoryQueue", "QueueBackend", "queue_from_spec"]
+__all__ = ["Delivery", "FrontierSnapshot", "MemoryQueue", "QueueBackend", "queue_from_spec"]
