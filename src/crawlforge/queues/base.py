@@ -1,9 +1,9 @@
-"""Queue backend interface: a priority queue of requests plus a seen-set."""
+"""Queue backend interface: per-domain priority queues of requests plus a seen-set."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
@@ -29,9 +29,14 @@ class Delivery:
 
 
 class QueueBackend(ABC):
-    """Storage for the crawl frontier.
+    """Storage for the crawl frontier, kept as one queue per domain.
 
-    Higher ``priority`` pops first; equal priorities pop in FIFO order.
+    Within a domain, higher ``priority`` pops first and equal priorities pop in FIFO order.
+    Across domains, a pop serves the domain whose next request has the highest priority;
+    domains tied on priority take turns (round-robin). ``skip`` names domains the caller
+    can't send to right now (throttled, at their concurrency cap, breaker open): their
+    requests stay queued, in place, and the next domain is served instead.
+
     ``add_seen`` must be atomic: it returns ``True`` only for the first caller
     that adds a fingerprint.
     """
@@ -48,7 +53,12 @@ class QueueBackend(ABC):
     async def push(self, request: Request) -> None: ...
 
     @abstractmethod
-    async def pop(self) -> Request | None: ...
+    async def pop(self, skip: Collection[str] = ()) -> Request | None:
+        """Pop the next request of a domain not in ``skip`` (None if there is none)."""
+
+    @abstractmethod
+    async def queued_domains(self, domains: Iterable[str]) -> set[str]:
+        """The subset of ``domains`` that have queued requests."""
 
     @abstractmethod
     async def size(self) -> int: ...
@@ -78,9 +88,9 @@ class QueueBackend(ABC):
     # Lease protocol. The defaults describe a backend without leases: ``receive`` is a
     # plain pop, ``requeue`` a plain push, and there is never anything in flight.
 
-    async def receive(self, lease_ttl: float) -> Delivery | None:
-        """Pop the next request; leasing backends hold it in flight for ``lease_ttl`` s."""
-        request = await self.pop()
+    async def receive(self, lease_ttl: float, skip: Collection[str] = ()) -> Delivery | None:
+        """Pop like ``pop``; leasing backends hold the request in flight for ``lease_ttl`` s."""
+        request = await self.pop(skip)
         return None if request is None else Delivery(request)
 
     async def ack(self, lease: str) -> bool:
