@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Collection
 
 from crawlforge.http import Request
 from crawlforge.queues.base import Delivery, QueueBackend
@@ -33,12 +34,13 @@ class Frontier:
         await self.backend.push(request)
         return PushResult.QUEUED
 
-    async def pop(self) -> Request | None:
-        return await self.backend.pop()
+    async def pop(self, skip: Collection[str] = ()) -> Request | None:
+        return await self.backend.pop(skip)
 
-    async def receive(self, lease_ttl: float) -> Delivery | None:
-        """Pop for processing; leasing backends hold the request until it is settled."""
-        return await self.backend.receive(lease_ttl)
+    async def receive(self, lease_ttl: float, skip: Collection[str] = ()) -> Delivery | None:
+        """Pop for processing from a domain not in ``skip``; leasing backends hold the
+        request until it is settled."""
+        return await self.backend.receive(lease_ttl, skip)
 
     async def size(self) -> int:
         return await self.backend.size()
