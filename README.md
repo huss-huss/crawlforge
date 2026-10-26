@@ -52,6 +52,33 @@ lines of library code).
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    Spider["Spider<br/>start_requests / parse"] -->|Request| Frontier["Frontier<br/>dedupe + max depth"]
+    Frontier --> Queue[("QueueBackend<br/>MemoryQueue / RedisQueue leases")]
+    Queue -->|next ready domain| Robots["RobotsCache<br/>RFC 9309, crawl-delay"]
+    Robots --> Breaker["CircuitBreaker<br/>per domain"]
+    Breaker --> Throttle["DomainThrottle<br/>semaphore + TokenBucket"]
+    Throttle --> Fetcher["HttpxFetcher / PlaywrightRenderer"]
+    Fetcher -->|2xx / 3xx| Spider
+    Fetcher -->|429 / 5xx / timeout| Retry["RetryPolicy<br/>backoff or Retry-After"]
+    Retry -->|deferred| Queue
+    Fetcher -->|exhausted / 4xx / callback error| DLQ[("DeadLetterQueue")]
+    Spider -->|item| Validate{"Pydantic<br/>validation"}
+    Validate -->|valid| Sinks[("Sinks<br/>JSONL / CSV / Postgres")]
+    Validate -->|invalid| Rejects[("RejectsSink")]
+    Queue -.-> Checkpoint[("Checkpoint")]
+    Fetcher -.-> Metrics["Metrics<br/>Prometheus /metrics"]
+```
+
+Requests flow from the spider into the frontier, which de-duplicates them and stores one queue per
+domain, in memory or in Redis with leases. Workers take the next request from a ready domain, check
+robots.txt, the domain's circuit breaker and its rate limit, then fetch. Transient failures are
+deferred and retried; permanent ones go to the dead-letter queue. Parsed items are validated before
+they reach a sink, and the queue state is checkpointed so a crawl can resume.
+
+The detailed request path:
+
 ```
                  +----------------------------------------------------------------+
   Spider         |                         Crawler (engine)                       |
